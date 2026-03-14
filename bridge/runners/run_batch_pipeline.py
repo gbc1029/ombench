@@ -23,9 +23,9 @@ def parse_args() -> argparse.Namespace:
                         help="direct: use experiment/ client; memrl: use SolveLLM adapter")
     parser.add_argument("--dataset-dir", type=Path,
                         default=Path(__file__).resolve().parents[2] / "datasets" / "OneMillion-Bench")
-    parser.add_argument("--base-url", default="http://10.245.198.154:8000")
+    parser.add_argument("--base-url", default="http://10.245.198.39:8000")
     parser.add_argument("--endpoint", default="/task/solve")
-    parser.add_argument("--model", default="holos-qwen35-397b/Qwen3.5-397B-A17B")
+    parser.add_argument("--model", default="sii-holos/Qwen 3.5 397B A17B")
     parser.add_argument("--judge-model", default=None,
                         help="Model for judging (defaults to --model)")
     parser.add_argument("--timeout", type=int, default=240)

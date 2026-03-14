@@ -32,7 +32,7 @@ holos-synergy-repo/
   "request_id": "omb-probe-v2",
   "benchmark": "onemillion",
   "task_id": "natural_science/9978/global",
-  "model": "holos-qwen35-397b/Qwen3.5-397B-A17B",
+  "model": "sii-holos/Qwen 3.5 397B A17B",
   "timeout": 240,
   "step_limit": 150,
   "system_prompt": "string",

@@ -10,11 +10,11 @@ from experiment.config.settings import SolveSettings
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Send a OneMillion-Bench solve request")
-    parser.add_argument("--base-url", default="http://10.245.198.154:8000")
+    parser.add_argument("--base-url", default="http://10.245.198.39:8000")
     parser.add_argument("--endpoint", default="/task/solve")
     parser.add_argument("--benchmark", default="onemillion")
     parser.add_argument("--task-id", required=True)
-    parser.add_argument("--model", default="holos-qwen35-397b/Qwen3.5-397B-A17B")
+    parser.add_argument("--model", default="sii-holos/Qwen 3.5 397B A17B")
     parser.add_argument("--timeout", type=int, default=240)
     parser.add_argument("--step-limit", type=int, default=150)
     parser.add_argument("--request-id", default="omb-probe-v2")

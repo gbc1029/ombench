@@ -34,7 +34,7 @@ class BaseJudge:
 class JudgeSettings:
     base_url: str
     endpoint: str = "/task/solve"
-    model: str = "holos-qwen35-397b/Qwen3.5-397B-A17B"
+    model: str = "sii-holos/Qwen 3.5 397B A17B"
     timeout: int = 240
     step_limit: int = 150
     request_id: str = "omb-judge"

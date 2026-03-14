@@ -6,10 +6,10 @@ from typing import Any, Dict, Optional
 
 @dataclass
 class SolveSettings:
-    base_url: str = "http://10.245.198.154:8000"
+    base_url: str = "http://10.245.198.39:8000"
     endpoint: str = "/task/solve"
     benchmark: str = "onemillion"
-    model: str = "holos-qwen35-397b/Qwen3.5-397B-A17B"
+    model: str = "sii-holos/Qwen 3.5 397B A17B"
     timeout: int = 240
     step_limit: int = 150
     request_id: str = "omb-probe-v2"
