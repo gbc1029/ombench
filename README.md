@@ -40,10 +40,18 @@ holos-synergy-repo/
 }
 ```
 
+### 安装
+
+在项目根目录执行一次即可：
+
+```bash
+pip install -e .
+```
+
 ### CLI 示例
 
 ```bash
-python experiment/scripts/solve_task.py \
+python -m experiment.scripts.solve_task \
   --task-id natural_science/9978/global \
   --dry-run
 ```
@@ -56,7 +64,7 @@ python experiment/scripts/solve_task.py \
 入口脚本：
 
 ```bash
-python bridge/runners/run_onemillion_memrl.py \
+python -m bridge.runners.run_onemillion_memrl \
   --dataset-dir /path/to/benchmark/cache/onemillion/dataset \
   --dry-run
 ```
@@ -67,34 +75,6 @@ python bridge/runners/run_onemillion_memrl.py \
 - `--dataset-dir` 指向 OneMillion-Bench 的数据目录
 - `--dry-run` 禁止向远端模型发送请求（仅构造流程）
 - 训练过程会将 `experiment` 的 `session_data.messages` 作为轨迹写入 MemRL 记忆
-
-## 端到端流程
-
-1) 数据读取
-- `bridge/dataset/onemillion_loader.py` 从 OneMillion-Bench 数据目录加载 `test.json`
-- 生成 `task_id = {subset}/{case_id}/{language}`
-
-2) Prompt 构造
-- `experiment/prompt/onemillion_prompt.py` 根据数据条目组装 prompt
-- 产出 `system_prompt` + `user_prompt`
-
-3) 远端请求
-- `experiment/client/solver.py` 发送 `/task/solve` 请求
-- `SolveSettings` 支持覆盖 `model/timeout/step_limit/request_id` 等字段
-- `--dry-run` 模式仅返回 `{status: "dry_run", request: payload}`
-
-4) 结果解析
-- 读取返回 JSON 中的 `status` 与 `result.answer`
-- `session_data.messages` 作为 MemRL 训练轨迹（原样保留）
-
-5) MemRL 记忆写入
-- `bridge/runners/run_onemillion_memrl.py` 调用 `MemoryService.add_memory`
-- `task_description` 使用 `user_prompt`
-- `trajectory` 使用 `session_data.messages` 序列化后的 JSON
-
-6) 后续训练扩展
-- 如需接入 MemRL 原始 runner，可在 `bridge/` 内新增适配器
-- 不修改 `memrl/` 源码，仅通过 `bridge/` 进行联动
 
 ## OMBench 评测（Synergy 接口）
 
@@ -113,13 +93,13 @@ python bridge/runners/run_onemillion_memrl.py \
 ### 评测入口
 
 ```bash
-python ombench_eval/run_eval.py --mode plain --dry-run
+python -m ombench_eval.run_eval --mode plain --dry-run
 ```
 
 #### rubric 模式（使用已有答案）
 
 ```bash
-python ombench_eval/run_eval.py \
+python -m ombench_eval.run_eval \
   --mode rubric \
   --responses-file /path/to/responses.jsonl \
   --dry-run
@@ -133,13 +113,13 @@ python ombench_eval/run_eval.py \
 #### plain 模式（不注入 rubrics）
 
 ```bash
-python ombench_eval/run_eval.py --mode plain --dry-run
+python -m ombench_eval.run_eval --mode plain --dry-run
 ```
 
 #### memrl 模式（注入记忆）
 
 ```bash
-python ombench_eval/run_eval.py \
+python -m ombench_eval.run_eval \
   --mode memrl \
   --memory-context /path/to/memory.json \
   --dry-run
@@ -167,12 +147,99 @@ python ombench_eval/run_eval.py \
 
 默认输出到控制台 JSON；可以用 `--output` 写入文件。
 
+## 批量管线（生成 → 打分 → 训练）
 
-- `experiment/client/solver.py`：HTTP 客户端封装
+批量管线将响应生成、rubric 打分和 MemRL 训练串联为一条自动化流水线，支持并发请求、失败重试和断点续跑。
+
+入口脚本：`bridge/runners/run_batch_pipeline.py`
+
+### 三阶段流程
+
+1. **Generate**：从 dataset 批量构建 prompt 并发送请求，`ThreadPoolExecutor` 并发，每条完成立即收集
+2. **Score**：从响应中提取 answer，结合 dataset 中的 rubrics 并发打分
+3. **Train**：将响应和分数写入 MemRL 记忆（串行，`MemoryService` 自管并发）
+
+### 基本用法
+
+```bash
+python -m bridge.runners.run_batch_pipeline \
+  --mode direct --workers 4 --limit 100 --dry-run
+```
+
+### 两种生成模式
+
+**direct 模式**：直接使用 `experiment/` 的 `SolveClient` 发送请求
+
+```bash
+python -m bridge.runners.run_batch_pipeline --mode direct --workers 4
+```
+
+**memrl 模式**：通过 `bridge/adapters/solve_llm.py` 的 `SolveLLM` 适配器发送请求
+
+```bash
+python -m bridge.runners.run_batch_pipeline --mode memrl --workers 4
+```
+
+### 跳过训练阶段
+
+仅生成响应 + 打分，不写入 MemRL 记忆：
+
+```bash
+python -m bridge.runners.run_batch_pipeline --mode direct --no-train --workers 4
+```
+
+### 输出到文件
+
+```bash
+python -m bridge.runners.run_batch_pipeline --mode direct --output results.jsonl
+```
+
+### 断点续跑
+
+中断后从上次结果继续（自动跳过已完成的 task_id）：
+
+```bash
+python -m bridge.runners.run_batch_pipeline --mode direct --output results.jsonl --resume results.jsonl
+```
+
+### 完整参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--mode` | `direct` | 生成模式：`direct` / `memrl` |
+| `--workers` | `4` | 并发数（generate 和 score 阶段） |
+| `--limit` | `0` | 最大处理条数（0 = 全部） |
+| `--max-retries` | `3` | 单条请求最大重试次数（指数退避） |
+| `--no-train` | `false` | 跳过 MemRL 训练阶段 |
+| `--dry-run` | `false` | 不发送实际请求 |
+| `--output` | 无 | 结果输出 JSONL 文件路径 |
+| `--resume` | 无 | 从之前的 JSONL 结果断点续跑 |
+| `--judge-model` | 同 `--model` | 打分模型（可与生成模型不同） |
+| `--dataset-dir` | `datasets/OneMillion-Bench` | 数据集目录 |
+
+### 汇总统计
+
+运行结束后自动输出统计：
+
+```
+========================================
+  Total: 100 | Completed: 95 | Failed: 5
+  Avg Score: 7.2/10.0 (72.0%)
+  By subset:
+    natural_science: 38/40 completed, avg 7.5/10.0
+    law:             25/28 completed, avg 6.8/10.0
+    ...
+========================================
+```
+
+
+- `experiment/client/solver.py`：HTTP 客户端封装（含重试）
 - `experiment/config/settings.py`：默认请求参数 + 覆盖
 - `bridge/adapters/solve_llm.py`：将 `/task/solve` 适配为 MemRL 的 `BaseLLM`
 - `bridge/adapters/hash_embedder.py`：本地 hash embedder（避免远端 embedding 调用）
-- `bridge/runners/run_onemillion_memrl.py`：联动训练入口
+- `bridge/runners/run_onemillion_memrl.py`：串行联动训练入口
+- `bridge/runners/batch_pipeline.py`：批量管线核心（`BatchPipeline` 类）
+- `bridge/runners/run_batch_pipeline.py`：批量管线 CLI 入口
 
 ## 注意事项
 

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -41,3 +45,26 @@ class SolveClient:
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             body = response.read().decode("utf-8")
         return json.loads(body)
+
+    def solve_with_retry(
+        self,
+        payload: Dict[str, Any],
+        *,
+        dry_run: bool = False,
+        max_retries: int = 3,
+        backoff_base: float = 2.0,
+    ) -> Dict[str, Any]:
+        last_exc: Optional[Exception] = None
+        for attempt in range(max_retries + 1):
+            try:
+                return self.solve(payload, dry_run=dry_run)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    wait = backoff_base ** attempt
+                    logger.warning(
+                        "solve attempt %d/%d failed (%s), retrying in %.1fs",
+                        attempt + 1, max_retries + 1, exc, wait,
+                    )
+                    time.sleep(wait)
+        raise last_exc  # type: ignore[misc]
