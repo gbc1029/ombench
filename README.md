@@ -209,7 +209,7 @@ python -m bridge.runners.run_batch_pipeline --mode direct --output outputs/resul
 |---|---|---|
 | `--mode` | `direct` | 生成模式：`direct` / `memrl` |
 | `--workers` | `4` | 并发数（generate 和 score 阶段） |
-| `--limit` | `0` | 最大处理条数（0 = 全部） |
+| `--limit` | `0` | 随机抽样任务数量（0 = 全部） |
 | `--max-retries` | `1` | 单条请求最大重试次数（指数退避） |
 | `--no-train` | `false` | 跳过 MemRL 训练阶段 |
 | `--dry-run` | `false` | 不发送实际请求 |

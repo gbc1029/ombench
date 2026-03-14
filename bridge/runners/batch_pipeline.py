@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -123,13 +124,11 @@ class BatchPipeline:
         if skip_ids:
             logger.info("Resuming: skipping %d already-completed task(s)", len(skip_ids))
 
-        tasks = []
-        for task_id, entry in entries.items():
-            if task_id in skip_ids:
-                continue
-            tasks.append((task_id, entry))
-            if self.limit and len(tasks) >= self.limit:
-                break
+        tasks = [(task_id, entry) for task_id, entry in entries.items() if task_id not in skip_ids]
+        if tasks:
+            random.shuffle(tasks)
+        if self.limit:
+            tasks = tasks[:self.limit]
 
         results: List[Dict[str, Any]] = []
         logger.info("Generating responses: %d tasks, %d workers, mode=%s", len(tasks), self.workers, mode)
