@@ -75,6 +75,7 @@ python -m bridge.runners.run_onemillion_memrl \
 - `--dataset-dir` 指向 OneMillion-Bench 的数据目录
 - `--dry-run` 禁止向远端模型发送请求（仅构造流程）
 - 训练过程会将 `experiment` 的 `session_data.messages` 作为轨迹写入 MemRL 记忆
+- 需要安装 `sentence-transformers`（本地嵌入使用）
 
 ## OMBench 评测（Synergy 接口）
 

@@ -38,12 +38,9 @@ def _write_mos_config(temp_dir: Path, *, api_key: str, base_url: str, model: str
                     },
                 },
                 "embedder": {
-                    "backend": "universal_api",
+                    "backend": "sentence_transformer",
                     "config": {
-                        "provider": "hash",
-                        "model_name_or_path": "hash-embedder",
-                        "api_key": api_key,
-                        "base_url": base_url,
+                        "model_name_or_path": "all-MiniLM-L6-v2",
                     },
                 },
                 "chunker": {"backend": "sentence", "config": {"chunk_size": 500}},

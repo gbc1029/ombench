@@ -52,4 +52,4 @@ watchfiles==1.1.0
 websockets==15.0.1
 
 # Optional: needed only for LocalEmbedder (memrl/providers/embedding.py)
-# sentence-transformers>=2.0
+sentence-transformers>=2.0

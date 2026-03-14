@@ -72,12 +72,9 @@ def _build_memory_service(args, llm, embedder, temp_dir):
                     },
                 },
                 "embedder": {
-                    "backend": "universal_api",
+                    "backend": "sentence_transformer",
                     "config": {
-                        "provider": "hash",
-                        "model_name_or_path": "hash-embedder",
-                        "api_key": "placeholder",
-                        "base_url": args.base_url,
+                        "model_name_or_path": "all-MiniLM-L6-v2",
                     },
                 },
                 "chunker": {"backend": "sentence", "config": {"chunk_size": 500}},
