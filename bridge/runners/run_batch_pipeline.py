@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
                         help="Concurrency level for generate and score stages")
     parser.add_argument("--limit", type=int, default=0,
                         help="Max number of tasks to process (0 = all)")
-    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--max-retries", type=int, default=1)
     parser.add_argument("--no-train", action="store_true",
                         help="Skip the MemRL training stage")
     parser.add_argument("--dry-run", action="store_true")

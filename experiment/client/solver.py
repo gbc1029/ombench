@@ -51,7 +51,7 @@ class SolveClient:
         payload: Dict[str, Any],
         *,
         dry_run: bool = False,
-        max_retries: int = 3,
+        max_retries: int = 1,
         backoff_base: float = 2.0,
     ) -> Dict[str, Any]:
         last_exc: Optional[Exception] = None

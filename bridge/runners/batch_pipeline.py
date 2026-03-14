@@ -60,7 +60,7 @@ class BatchPipeline:
         workers: int = 4,
         limit: int = 0,
         dry_run: bool = False,
-        max_retries: int = 3,
+        max_retries: int = 1,
         output: Optional[Path] = None,
     ) -> None:
         self.client = client
