@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-train", action="store_true",
                         help="Skip the MemRL training stage")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--output", type=Path, default=None,
+    parser.add_argument("--output", type=Path, default=Path("outputs/results.jsonl"),
                         help="Output JSONL file for results")
     parser.add_argument("--resume", type=Path, default=None,
                         help="Resume from a previous output JSONL (skip completed task_ids)")

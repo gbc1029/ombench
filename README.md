@@ -146,7 +146,7 @@ python -m ombench_eval.run_eval \
 
 ### 评测输出
 
-默认输出到控制台 JSON；可以用 `--output` 写入文件。
+默认输出到 `outputs/results.jsonl`，也可用 `--output` 指定其它路径。
 
 ## 批量管线（生成 → 打分 → 训练）
 
@@ -192,7 +192,7 @@ python -m bridge.runners.run_batch_pipeline --mode direct --no-train --workers 4
 ### 输出到文件
 
 ```bash
-python -m bridge.runners.run_batch_pipeline --mode direct --output results.jsonl
+python -m bridge.runners.run_batch_pipeline --mode direct --output outputs/results.jsonl
 ```
 
 ### 断点续跑
@@ -200,7 +200,7 @@ python -m bridge.runners.run_batch_pipeline --mode direct --output results.jsonl
 中断后从上次结果继续（自动跳过已完成的 task_id）：
 
 ```bash
-python -m bridge.runners.run_batch_pipeline --mode direct --output results.jsonl --resume results.jsonl
+python -m bridge.runners.run_batch_pipeline --mode direct --output outputs/results.jsonl --resume outputs/results.jsonl
 ```
 
 ### 完整参数
@@ -213,7 +213,7 @@ python -m bridge.runners.run_batch_pipeline --mode direct --output results.jsonl
 | `--max-retries` | `3` | 单条请求最大重试次数（指数退避） |
 | `--no-train` | `false` | 跳过 MemRL 训练阶段 |
 | `--dry-run` | `false` | 不发送实际请求 |
-| `--output` | 无 | 结果输出 JSONL 文件路径 |
+| `--output` | `outputs/results.jsonl` | 结果输出 JSONL 文件路径 |
 | `--resume` | 无 | 从之前的 JSONL 结果断点续跑 |
 | `--judge-model` | 同 `--model` | 打分模型（可与生成模型不同） |
 | `--dataset-dir` | `datasets/OneMillion-Bench` | 数据集目录 |

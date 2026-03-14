@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--responses-file", type=Path, default=None)
     parser.add_argument("--memory-context", type=Path, default=None)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--output", type=Path, default=Path("outputs/results.jsonl"))
     parser.add_argument("--base-url", default="http://10.245.198.39:8000")
     parser.add_argument("--endpoint", default="/task/solve")
     parser.add_argument("--model", default="sii-holos/Qwen 3.5 397B A17B")

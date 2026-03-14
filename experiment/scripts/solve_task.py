@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user-prompt", default="")
     parser.add_argument("--include-task-prompt", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Do not send the request")
-    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--output", type=Path, default=Path("outputs/results.jsonl"))
     return parser.parse_args()
 
 
