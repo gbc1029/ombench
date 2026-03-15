@@ -84,7 +84,7 @@ def main() -> int:
     list_models(base_url, headers)
 
     # Step 2: try chat (update model_id after seeing the list above)
-    model_id = "sii-holos/Qwen 3.5 397B A17B"
+    model_id = "qwen3.5-397b-a17b"
     return chat_test(base_url, headers, model_id)
 
 
