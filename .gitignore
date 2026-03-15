@@ -23,3 +23,7 @@ results/
 # OS
 .DS_Store
 Thumbs.db
+
+# else
+# Egg info
+*.egg-info/
