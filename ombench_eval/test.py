@@ -5,20 +5,34 @@ import urllib.error
 import urllib.request
 
 
-def main() -> int:
-    api_key = os.environ.get("INF_API_KEY")
-    if not api_key:
-        print("INF_API_KEY not set in environment", file=sys.stderr)
-        return 1
+def list_models(base_url: str, headers: dict) -> None:
+    url = f"{base_url}/v1/models"
+    print(f"GET {url}")
+    print("-" * 40)
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            result = json.loads(body)
+            models = result.get("data", [])
+            if models:
+                print(f"Available models ({len(models)}):")
+                for m in models:
+                    mid = m.get("id", "?")
+                    print(f"  - {mid}")
+            else:
+                print("No models found. Full response:")
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(f"HTTP {exc.code}: {exc.reason}", file=sys.stderr)
+        print(f"Response body: {body}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Request failed: {exc}", file=sys.stderr)
 
-    base_url = "https://holos.openapi-qb.sii.edu.cn"
+
+def chat_test(base_url: str, headers: dict, model_id: str) -> int:
     url = f"{base_url}/v1/chat/completions"
-    model_id = "sii-holos/Qwen 3.5 397B A17B"
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
     payload = {
         "model": model_id,
         "messages": [
@@ -30,16 +44,15 @@ def main() -> int:
     }
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-    print(f"POST {url}")
+    print(f"\nPOST {url}")
     print(f"Model: {model_id}")
-    print(f"Payload: {json.dumps(payload, ensure_ascii=False, indent=2)}")
     print("-" * 40)
 
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    req = urllib.request.Request(url, data=data, headers={**headers, "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            print(f"Status: {response.status}")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print(f"Status: {resp.status}")
             result = json.loads(body)
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -55,8 +68,24 @@ def main() -> int:
     except Exception as exc:
         print(f"Request failed: {exc}", file=sys.stderr)
         return 2
-
     return 0
+
+
+def main() -> int:
+    api_key = os.environ.get("INF_API_KEY")
+    if not api_key:
+        print("INF_API_KEY not set in environment", file=sys.stderr)
+        return 1
+
+    base_url = "https://holos.openapi-qb.sii.edu.cn"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    # Step 1: list available models
+    list_models(base_url, headers)
+
+    # Step 2: try chat (update model_id after seeing the list above)
+    model_id = "sii-holos/Qwen 3.5 397B A17B"
+    return chat_test(base_url, headers, model_id)
 
 
 if __name__ == "__main__":
