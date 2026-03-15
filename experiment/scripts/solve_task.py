@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from experiment.client.solver import SolveClient
-from experiment.config.settings import SolveSettings
+from experiment.config.settings import SolveSettings, resolve_model_alias
 
 
 def parse_args() -> argparse.Namespace:
@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--endpoint", default="/task/solve")
     parser.add_argument("--benchmark", default="onemillion")
     parser.add_argument("--task-id", required=True)
-    parser.add_argument("--model", default="sii-holos/Qwen 3.5 397B A17B")
+    parser.add_argument("--model", default="qwen")
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--step-limit", type=int, default=150)
     parser.add_argument("--request-id", default="omb-probe-v2")
@@ -32,7 +32,7 @@ def main() -> None:
         base_url=args.base_url,
         endpoint=args.endpoint,
         benchmark=args.benchmark,
-        model=args.model,
+        model=resolve_model_alias(args.model),
         timeout=args.timeout,
         step_limit=args.step_limit,
         request_id=args.request_id,

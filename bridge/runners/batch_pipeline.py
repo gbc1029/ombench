@@ -3,23 +3,28 @@ from __future__ import annotations
 import json
 import logging
 import random
-import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
 
 from tqdm import tqdm
 
-from bridge.adapters.solve_llm import SolveLLM
-from bridge.dataset.onemillion_loader import load_entries
 from experiment.client.solver import SolveClient
 from experiment.config.settings import SolveSettings
-from experiment.prompt.onemillion_prompt import build_prompts
+from experiment.prompt.onemillion_prompt import apply_memory, build_plain_prompts
 from ombench_eval.evaluator import score_response, score_responses_batch
 from ombench_eval.judge import BaseJudge
 
 logger = logging.getLogger(__name__)
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    message = str(exc).lower()
+    return "timeout" in message or "timed out" in message
 
 
 def _extract_answer(response: Dict[str, Any]) -> str:
@@ -56,36 +61,69 @@ class BatchPipeline:
         client: SolveClient,
         settings: SolveSettings,
         judge: BaseJudge,
-        llm: Optional[SolveLLM] = None,
         memory_service: Optional[Any] = None,
+        memory_context: Optional[Dict[str, str]] = None,
         workers: int = 4,
         limit: int = 0,
         dry_run: bool = False,
         max_retries: int = 1,
         output: Optional[Path] = None,
-        score_batch_size: int = 1,
         score_workers: int = 4,
     ) -> None:
         self.client = client
         self.settings = settings
         self.judge = judge
-        self.llm = llm
         self.memory_service = memory_service
+        self.memory_context = memory_context or {}
         self.workers = max(workers, 1)
         self.limit = limit
         self.dry_run = dry_run
         self.max_retries = max_retries
         self.output = output
-        self.score_batch_size = max(score_batch_size, 1)
         self.score_workers = max(score_workers, 1)
 
-    def _generate_one_direct(self, task_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
-        system_prompt, user_prompt = build_prompts(entry, include_rubrics=False)
+    def _score_item(self, item: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            score = score_response(
+                judge=self.judge,
+                question=entry.get("question", ""),
+                response=item.get("answer", ""),
+                rubrics=entry.get("rubrics", []),
+                system_prompt=entry.get("system_prompt"),
+            )
+            item["score"] = score
+        except Exception as exc:
+            if _is_timeout_error(exc):
+                logger.warning("Score timeout for task_id: %s", item.get("task_id"))
+            logger.error("Task %s score failed: %s", item.get("task_id"), exc)
+            item["score"] = {"raw": str(exc)}
+        return item
+
+    def _build_prompts(
+        self,
+        task_id: str,
+        entry: Dict[str, Any],
+        *,
+        mode: str,
+    ) -> Dict[str, str]:
+        system_prompt, user_prompt = build_plain_prompts(entry)
+        if mode == "memrl":
+            user_prompt = apply_memory(user_prompt, self.memory_context.get(task_id))
+        return {"system_prompt": system_prompt, "user_prompt": user_prompt}
+
+    def _generate_one_direct(
+        self,
+        task_id: str,
+        entry: Dict[str, Any],
+        *,
+        mode: str,
+    ) -> Dict[str, Any]:
+        prompts = self._build_prompts(task_id, entry, mode=mode)
         payload = self.settings.build_payload(
             overrides={
                 "task_id": task_id,
-                "system_prompt": system_prompt,
-                "user_prompt": user_prompt,
+                "system_prompt": prompts["system_prompt"],
+                "user_prompt": prompts["user_prompt"],
             },
         )
         response = self.client.solve_with_retry(
@@ -95,50 +133,44 @@ class BatchPipeline:
             "task_id": task_id,
             "response": response,
             "answer": _extract_answer(response),
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-        }
-
-    def _generate_one_memrl(self, task_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
-        if self.llm is None:
-            raise RuntimeError("SolveLLM is required for memrl mode")
-        system_prompt, user_prompt = build_prompts(entry, include_rubrics=False)
-        response = self.llm.solve_raw(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            task_id=task_id,
-        )
-        return {
-            "task_id": task_id,
-            "response": response,
-            "answer": _extract_answer(response),
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
+            "system_prompt": prompts["system_prompt"],
+            "user_prompt": prompts["user_prompt"],
         }
 
     def generate(
         self,
         entries: Dict[str, Dict[str, Any]],
         *,
-        mode: str = "direct",
+        mode: str = "plain",
         resume_from: Optional[Path] = None,
     ) -> List[Dict[str, Any]]:
-        worker_fn = self._generate_one_direct if mode == "direct" else self._generate_one_memrl
-
         skip_ids = _load_completed_ids(resume_from) if resume_from else set()
         if skip_ids:
             logger.info("Resuming: skipping %d already-completed task(s)", len(skip_ids))
 
-        tasks = [(task_id, entry) for task_id, entry in entries.items() if task_id not in skip_ids]
+        tasks = [
+            (task_id, entry)
+            for task_id, entry in entries.items()
+            if task_id not in skip_ids
+        ]
         if tasks:
             random.shuffle(tasks)
         if self.limit:
-            tasks = tasks[:self.limit]
+            tasks = tasks[: self.limit]
 
         results: List[Dict[str, Any]] = []
-        logger.info("Generating responses: %d tasks, %d workers, mode=%s", len(tasks), self.workers, mode)
+        logger.info(
+            "Generating responses: %d tasks, %d workers, mode=%s",
+            len(tasks),
+            self.workers,
+            mode,
+        )
 
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            future_map = {pool.submit(worker_fn, tid, ent): tid for tid, ent in tasks}
+            future_map = {
+                pool.submit(self._generate_one_direct, tid, ent, mode=mode): tid
+                for tid, ent in tasks
+            }
             with tqdm(total=len(future_map), desc="Generate", unit="task") as pbar:
                 for future in as_completed(future_map):
                     tid = future_map[future]
@@ -147,28 +179,87 @@ class BatchPipeline:
                         results.append(result)
                     except Exception as exc:
                         logger.error("Task %s generation failed: %s", tid, exc)
-                        results.append({
-                            "task_id": tid, "response": None, "answer": "",
-                            "error": str(exc), "stage": "generate",
-                        })
+                        results.append(
+                            {
+                                "task_id": tid,
+                                "response": None,
+                                "answer": "",
+                                "error": str(exc),
+                                "stage": "generate",
+                            }
+                        )
                     pbar.update(1)
 
         return results
 
-    def _score_one(self, item: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
-        answer = item.get("answer", "")
-        if not answer or item.get("error"):
-            item["score"] = None
-            return item
-        score = score_response(
-            judge=self.judge,
-            question=entry.get("question", ""),
-            response=answer,
-            rubrics=entry.get("rubrics", []),
-            system_prompt=entry.get("system_prompt"),
+    def generate_and_score(
+        self,
+        entries: Dict[str, Dict[str, Any]],
+        *,
+        mode: str = "plain",
+        resume_from: Optional[Path] = None,
+    ) -> List[Dict[str, Any]]:
+        skip_ids = _load_completed_ids(resume_from) if resume_from else set()
+        if skip_ids:
+            logger.info("Resuming: skipping %d already-completed task(s)", len(skip_ids))
+
+        tasks = [
+            (task_id, entry)
+            for task_id, entry in entries.items()
+            if task_id not in skip_ids
+        ]
+        if tasks:
+            random.shuffle(tasks)
+        if self.limit:
+            tasks = tasks[: self.limit]
+
+        results: List[Dict[str, Any]] = []
+        logger.info(
+            "Generating responses: %d tasks, %d workers, mode=%s",
+            len(tasks),
+            self.workers,
+            mode,
         )
-        item["score"] = score
-        return item
+        logger.info(
+            "Scoring responses: %d tasks, workers=%d",
+            len(tasks),
+            self.score_workers,
+        )
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            future_map = {
+                pool.submit(self._generate_one_direct, tid, ent, mode=mode): tid
+                for tid, ent in tasks
+            }
+            with (
+                tqdm(total=len(future_map), desc="Generate", unit="task") as gen_bar,
+                tqdm(total=len(future_map), desc="Score", unit="task") as score_bar,
+            ):
+                for future in as_completed(future_map):
+                    tid = future_map[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        logger.error("Task %s generation failed: %s", tid, exc)
+                        result = {
+                            "task_id": tid,
+                            "response": None,
+                            "answer": "",
+                            "error": str(exc),
+                            "stage": "generate",
+                            "score": None,
+                        }
+                    else:
+                        if result.get("answer") and not result.get("error"):
+                            entry = entries.get(tid, {})
+                            result = self._score_item(result, entry)
+                        else:
+                            result["score"] = None
+                    results.append(result)
+                    gen_bar.update(1)
+                    score_bar.update(1)
+
+        return results
 
     def score(
         self,
@@ -180,18 +271,24 @@ class BatchPipeline:
         for i, r in enumerate(results):
             if r.get("answer") and not r.get("error"):
                 entry = entries.get(r["task_id"], {})
-                score_items.append({
-                    "question": entry.get("question", ""),
-                    "response": r.get("answer", ""),
-                    "rubrics": entry.get("rubrics", []),
-                    "system_prompt": entry.get("system_prompt"),
-                })
+                score_items.append(
+                    {
+                        "task_id": r.get("task_id"),
+                        "question": entry.get("question", ""),
+                        "response": r.get("answer", ""),
+                        "rubrics": entry.get("rubrics", []),
+                        "system_prompt": entry.get("system_prompt"),
+                    }
+                )
                 scoreable_indices.append(i)
 
         logger.info(
-            "Scoring responses: %d / %d tasks, batch_size=%d, workers=%d",
-            len(score_items), len(results), self.score_batch_size, self.score_workers,
+            "Scoring responses: %d / %d tasks, workers=%d",
+            len(score_items),
+            len(results),
+            self.score_workers,
         )
+
 
         if not score_items:
             return results
@@ -199,8 +296,9 @@ class BatchPipeline:
         batch_scores = score_responses_batch(
             judge=self.judge,
             items=score_items,
-            batch_size=self.score_batch_size,
+            batch_size=1,
             max_workers=self.score_workers,
+            show_progress=True,
         )
 
         for pos, idx in enumerate(scoreable_indices):
@@ -224,7 +322,8 @@ class BatchPipeline:
             status = response.get("status") if isinstance(response, dict) else None
             trajectory = json.dumps(
                 response.get("session_data", {}).get("messages", [])
-                if isinstance(response, dict) else [],
+                if isinstance(response, dict)
+                else [],
                 ensure_ascii=False,
             )
             score_info = item.get("score", {})
@@ -240,7 +339,9 @@ class BatchPipeline:
                     success=is_success,
                     metadata={
                         "task_id": item["task_id"],
-                        "request_id": response.get("request_id") if isinstance(response, dict) else None,
+                        "request_id": response.get("request_id")
+                        if isinstance(response, dict)
+                        else None,
                         "status": status,
                         "score": score_info,
                     },
@@ -272,7 +373,11 @@ class BatchPipeline:
     def print_summary(self, results: List[Dict[str, Any]]) -> None:
         total = len(results)
         errors = [r for r in results if r.get("error")]
-        scored = [r for r in results if isinstance(r.get("score"), dict) and r["score"].get("max_score")]
+        scored = [
+            r
+            for r in results
+            if isinstance(r.get("score"), dict) and r["score"].get("max_score")
+        ]
 
         print(f"\n{'=' * 40}")
         print(f"  Total: {total} | Completed: {total - len(errors)} | Failed: {len(errors)}")
@@ -293,11 +398,17 @@ class BatchPipeline:
             print("  By subset:")
             for subset, items in sorted(by_subset.items()):
                 ok = sum(1 for i in items if not i.get("error"))
-                sub_scored = [i for i in items if isinstance(i.get("score"), dict) and i["score"].get("max_score")]
+                sub_scored = [
+                    i
+                    for i in items
+                    if isinstance(i.get("score"), dict) and i["score"].get("max_score")
+                ]
                 if sub_scored:
                     s = sum(i["score"]["score"] for i in sub_scored) / len(sub_scored)
                     m = sum(i["score"]["max_score"] for i in sub_scored) / len(sub_scored)
-                    print(f"    {subset}: {ok}/{len(items)} completed, avg {s:.1f}/{m:.1f}")
+                    print(
+                        f"    {subset}: {ok}/{len(items)} completed, avg {s:.1f}/{m:.1f}"
+                    )
                 else:
                     print(f"    {subset}: {ok}/{len(items)} completed, no scores")
         print(f"{'=' * 40}\n")
@@ -306,12 +417,11 @@ class BatchPipeline:
         self,
         entries: Dict[str, Dict[str, Any]],
         *,
-        mode: str = "direct",
+        mode: str = "plain",
         skip_train: bool = False,
         resume_from: Optional[Path] = None,
     ) -> List[Dict[str, Any]]:
-        results = self.generate(entries, mode=mode, resume_from=resume_from)
-        results = self.score(results, entries)
+        results = self.generate_and_score(entries, mode=mode, resume_from=resume_from)
         if not skip_train:
             self.train(results)
         self._save_results(results)

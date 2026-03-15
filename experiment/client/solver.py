@@ -31,7 +31,7 @@ class SolveClient:
         self.headers = headers or {"Content-Type": "application/json"}
         self.timeout = timeout
 
-    def solve(self, payload: Dict[str, Any], *, dry_run: bool = False) -> Dict[str, Any]:
+    def solve(self, payload: Dict[str, Any],timeout = self.timeout, *, dry_run: bool = False) -> Dict[str, Any]:
         if dry_run:
             return {"status": "dry_run", "request": payload}
 
@@ -42,7 +42,7 @@ class SolveClient:
             headers=self.headers,
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
         return json.loads(body)
 
@@ -56,8 +56,9 @@ class SolveClient:
     ) -> Dict[str, Any]:
         last_exc: Optional[Exception] = None
         for attempt in range(max_retries + 1):
+            timeout = self.timeout if attempt == 0 else 2 * self.timeout
             try:
-                return self.solve(payload, dry_run=dry_run)
+                return self.solve(payload,timeout = timeout, dry_run=dry_run)
             except Exception as exc:
                 last_exc = exc
                 if attempt < max_retries:

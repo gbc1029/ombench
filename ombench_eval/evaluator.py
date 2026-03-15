@@ -4,6 +4,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
+from tqdm import tqdm
+
 from ombench_eval.prompts import (
     RUBRIC_JUDGE_SYSTEM_PROMPT,
     build_batch_rubric_judge_prompt,
@@ -12,6 +14,13 @@ from ombench_eval.prompts import (
 from ombench_eval.judge import BaseJudge
 
 logger = logging.getLogger(__name__)
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    message = str(exc).lower()
+    return "timeout" in message or "timed out" in message
 
 
 def _fallback_score(rubrics: List[Dict[str, Any]], results: Dict[str, Any]) -> Dict[str, Any]:
@@ -94,7 +103,9 @@ def score_responses_batch(
     items: List[Dict[str, Any]],
     batch_size: int = 1,
     max_workers: int = 4,
+    show_progress: bool = False,
 ) -> List[Dict[str, Any]]:
+
     batch_size = max(batch_size, 1)
     max_workers = max(max_workers, 1)
 
@@ -109,14 +120,39 @@ def score_responses_batch(
             pool.submit(_score_batch_group, judge, group): gidx
             for gidx, group in enumerate(groups)
         }
-        for future in as_completed(future_map):
-            gidx = future_map[future]
-            try:
-                all_results[gidx] = future.result()
-            except Exception as exc:
-                logger.error("Score batch group %d failed: %s", gidx, exc)
-                group = groups[gidx]
-                all_results[gidx] = [{"raw": str(exc)} for _ in group]
+        progress = (
+            tqdm(total=len(future_map), desc="Score", unit="batch")
+            if show_progress
+            else None
+        )
+        try:
+            for future in as_completed(future_map):
+                gidx = future_map[future]
+                try:
+                    all_results[gidx] = future.result()
+                except Exception as exc:
+                    logger.error("Score batch group %d failed: %s", gidx, exc)
+                    group = groups[gidx]
+                    if _is_timeout_error(exc):
+                        task_ids = [
+                            str(item.get("task_id"))
+                            for item in group
+                            if item.get("task_id")
+                        ]
+                        if task_ids:
+                            logger.warning(
+                                "Score timeout for task_ids: %s",
+                                ", ".join(task_ids),
+                            )
+                        else:
+                            logger.warning("Score timeout for task_ids: unknown")
+                    all_results[gidx] = [{"raw": str(exc)} for _ in group]
+                finally:
+                    if progress is not None:
+                        progress.update(1)
+        finally:
+            if progress is not None:
+                progress.close()
 
     flat: List[Dict[str, Any]] = []
     for group_result in all_results:

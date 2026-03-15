@@ -26,7 +26,6 @@ holos-synergy-repo/
 │   ├── judge.py               # Judge 实现（OpenAI 兼容 API）
 │   ├── prompts.py             # 评分提示词模板
 │   ├── run_eval.py            # 评测 CLI 入口
-│   └── test.py                # API 连通性测试
 ├── memrl/                     # MemRL 源码（原结构保留）
 └── datasets/                  # 数据集
     └── OneMillion-Bench/
@@ -50,13 +49,11 @@ export INF_API_KEY="your_api_key_here"
 
 ## 快速验证
 
-运行连通性测试，确认 API 可访问：
+可用 `run_eval` 的 `--dry-run` 做请求预览：
 
 ```bash
-python ombench_eval/test.py
+python -m ombench_eval.run_eval --mode plain --dry-run
 ```
-
-该脚本会先列出可用模型，再发送一条测试 chat 请求。
 
 ---
 
@@ -71,7 +68,7 @@ python ombench_eval/test.py
   "request_id": "omb-probe-v2",
   "benchmark": "onemillion",
   "task_id": "natural_science/9978/global",
-  "model": "sii-holos/Qwen 3.5 397B A17B",
+  "model": "qwen",
   "timeout": 1200,
   "step_limit": 150,
   "system_prompt": "string",
@@ -94,7 +91,7 @@ python -m experiment.scripts.solve_task \
 | `--task-id` | 必填 | 任务 ID |
 | `--base-url` | `http://10.245.198.39:8000` | 模型服务地址 |
 | `--endpoint` | `/task/solve` | 请求端点 |
-| `--model` | `sii-holos/Qwen 3.5 397B A17B` | 生成模型 |
+| `--model` | `qwen` | 生成模型（别名：`qwen`/`nex`） |
 | `--timeout` | `1200` | 请求超时（秒） |
 | `--step-limit` | `150` | 步数限制 |
 | `--dry-run` | `false` | 仅打印请求体，不发送 |
@@ -105,8 +102,8 @@ python -m experiment.scripts.solve_task \
 
 评测模块位于 `ombench_eval/`，支持三种模式：
 
-1. **rubric 模式**：输入已有回答 + rubrics 进行评分
-2. **plain 模式**：使用 dataset 的 question 生成回答（不注入 rubrics），再评分
+1. **rubric 模式**：输入已有回答 + rubrics 进行评分（不生成）
+2. **plain 模式**：使用 dataset 的 question 生成回答（不注入 rubrics / domain），再评分
 3. **memrl 模式**：在 plain 基础上注入 MemRL 记忆上下文，再评分
 
 ### 架构说明
@@ -178,7 +175,7 @@ python -m ombench_eval.run_eval \
 | `--output` | `outputs/results.jsonl` | 结果输出路径 |
 | `--base-url` | `http://10.245.198.39:8000` | 生成模型服务地址 |
 | `--endpoint` | `/task/solve` | 生成请求端点 |
-| `--model` | `sii-holos/Qwen 3.5 397B A17B` | 生成模型 |
+| `--model` | `qwen` | 生成模型（别名：`qwen`/`nex`） |
 | `--judge-model` | `qwen3.5-397b-a17b` | 评分模型 |
 | `--judge-base-url` | `https://holos.openapi-qb.sii.edu.cn` | 评分 API 地址 |
 | `--timeout` | `1200` | 生成请求超时（秒） |
@@ -190,39 +187,32 @@ python -m ombench_eval.run_eval \
 
 ## 批量管线（生成 → 打分 → 训练）
 
-批量管线将响应生成、rubric 打分和 MemRL 训练串联为一条自动化流水线，支持并发请求、批量评分、失败重试和断点续跑。
+批量管线将响应生成、rubric 打分和 MemRL 训练串联为一条自动化流水线，支持并发生成、逐条评分、失败重试和断点续跑。
 
 入口脚本：`bridge/runners/run_batch_pipeline.py`
 
 ### 三阶段流程
 
 1. **Generate**：从 dataset 批量构建 prompt 并发送到 `/task/solve`，`ThreadPoolExecutor` 并发
-2. **Score**：将待评分内容按 `batch_size` 分组，`score_workers` 个并发请求发送到评分 API（`/v1/chat/completions`）
+2. **Score**：每条生成结果完成后立即发送到评分 API（`/v1/chat/completions`），按 `score_workers` 并发
 3. **Train**：将响应和分数写入 MemRL 记忆（串行，`MemoryService` 自管并发）
 
 ### 基本用法
 
 ```bash
-# 默认：4 并发生成，每请求 1 条评分，4 并发评分
+# 默认：4 并发生成，4 并发评分
 python -m bridge.runners.run_batch_pipeline \
-  --mode direct --workers 4 --dry-run
-
-# 自定义评分：每请求 3 条内容，8 并发评分
-python -m bridge.runners.run_batch_pipeline \
-  --mode direct --score-batch-size 3 --score-workers 8
+  --mode plain --workers 4 --dry-run
 ```
 
-### 两种生成模式
+### 生成模式
 
-**direct 模式**：直接使用 `SolveClient` 发送请求
-
-```bash
-python -m bridge.runners.run_batch_pipeline --mode direct --workers 4
-```
-
-**memrl 模式**：通过 `SolveLLM` 适配器发送请求
+- **plain**：只用 `question` 生成
+- **memrl**：`question + memory` 生成（需 `--memory-context`）
+- **rubric**：仅评分（需 `--responses-file`，不生成/不训练）
 
 ```bash
+python -m bridge.runners.run_batch_pipeline --mode plain --workers 4
 python -m bridge.runners.run_batch_pipeline --mode memrl --workers 4
 ```
 
@@ -231,7 +221,7 @@ python -m bridge.runners.run_batch_pipeline --mode memrl --workers 4
 仅生成响应 + 打分，不写入 MemRL 记忆：
 
 ```bash
-python -m bridge.runners.run_batch_pipeline --mode direct --no-train --workers 4
+python -m bridge.runners.run_batch_pipeline --mode plain --no-train --workers 4
 ```
 
 ### 断点续跑
@@ -240,7 +230,7 @@ python -m bridge.runners.run_batch_pipeline --mode direct --no-train --workers 4
 
 ```bash
 python -m bridge.runners.run_batch_pipeline \
-  --mode direct \
+  --mode plain \
   --output outputs/results.jsonl \
   --resume outputs/results.jsonl
 ```
@@ -249,11 +239,11 @@ python -m bridge.runners.run_batch_pipeline \
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--mode` | `direct` | 生成模式：`direct` / `memrl` |
+| `--mode` | `plain` | 生成模式：`plain` / `memrl` / `rubric` |
 | `--dataset-dir` | `datasets/OneMillion-Bench` | 数据集目录 |
 | `--base-url` | `http://10.245.198.39:8000` | 生成模型服务地址 |
 | `--endpoint` | `/task/solve` | 生成请求端点 |
-| `--model` | `sii-holos/Qwen 3.5 397B A17B` | 生成模型 |
+| `--model` | `qwen` | 生成模型（别名：`qwen`/`nex`） |
 | `--timeout` | `1200` | 生成请求超时（秒） |
 | `--step-limit` | `150` | 生成步数限制 |
 | `--workers` | `4` | 生成阶段并发数 |
@@ -261,7 +251,6 @@ python -m bridge.runners.run_batch_pipeline \
 | `--judge-model` | `qwen3.5-397b-a17b` | 评分模型 |
 | `--judge-base-url` | `https://holos.openapi-qb.sii.edu.cn` | 评分 API 地址 |
 | `--judge-timeout` | `600` | 评分请求超时（秒） |
-| `--score-batch-size` | `1` | 单条评分请求包含的待评内容数量 |
 | `--score-workers` | `4` | 评分阶段并发数 |
 | `--limit` | `0` | 随机抽样任务数量（0 = 全部） |
 | `--no-train` | `false` | 跳过 MemRL 训练阶段 |
@@ -303,7 +292,7 @@ python -m bridge.runners.run_onemillion_memrl \
 | `--dataset-dir` | `datasets/OneMillion-Bench` | 数据集目录 |
 | `--base-url` | `http://10.245.198.39:8000` | 模型服务地址 |
 | `--endpoint` | `/task/solve` | 请求端点 |
-| `--model` | `sii-holos/Qwen 3.5 397B A17B` | 生成模型 |
+| `--model` | `qwen` | 生成模型（别名：`qwen`/`nex`） |
 | `--timeout` | `1200` | 请求超时（秒） |
 | `--step-limit` | `150` | 步数限制 |
 | `--dry-run` | `false` | 不发送实际请求 |
@@ -349,7 +338,6 @@ python -m bridge.runners.run_onemillion_memrl \
 | `ombench_eval/judge.py` | Judge 实现（`OpenAIJudge`） |
 | `ombench_eval/prompts.py` | 评分提示词（单条 + 批量模板） |
 | `ombench_eval/run_eval.py` | 评测 CLI 入口 |
-| `ombench_eval/test.py` | API 连通性测试 |
 
 ## 注意事项
 
