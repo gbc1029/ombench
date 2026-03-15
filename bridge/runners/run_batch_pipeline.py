@@ -28,10 +28,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="sii-holos/Qwen 3.5 397B A17B")
     parser.add_argument("--judge-model", default=None,
                         help="Model for judging (defaults to --model)")
-    parser.add_argument("--timeout", type=int, default=240)
+    parser.add_argument("--timeout", type=int, default=1200,
+                        help="Timeout for generation requests (default: 1200)")
+    parser.add_argument("--judge-timeout", type=int, default=600,
+                        help="Timeout for scoring/judge requests (default: 600)")
     parser.add_argument("--step-limit", type=int, default=150)
     parser.add_argument("--workers", type=int, default=4,
-                        help="Concurrency level for generate and score stages")
+                        help="Concurrency level for generate stage")
+    parser.add_argument("--score-batch-size", type=int, default=1,
+                        help="Number of items per scoring request (default: 1)")
+    parser.add_argument("--score-workers", type=int, default=4,
+                        help="Concurrency level for scoring stage (default: 4)")
     parser.add_argument("--limit", type=int, default=0,
                         help="Max number of tasks to process (0 = all)")
     parser.add_argument("--max-retries", type=int, default=1)
@@ -126,7 +133,7 @@ def main() -> None:
     judge = SolveJudge(
         JudgeSettings(
             base_url=args.base_url, endpoint=args.endpoint,
-            model=judge_model, timeout=args.timeout, step_limit=args.step_limit,
+            model=judge_model, timeout=args.judge_timeout, step_limit=args.step_limit,
         ),
         dry_run=args.dry_run,
     )
@@ -155,6 +162,8 @@ def main() -> None:
             memory_service=memory_service, workers=args.workers,
             limit=args.limit, dry_run=args.dry_run,
             max_retries=args.max_retries, output=args.output,
+            score_batch_size=args.score_batch_size,
+            score_workers=args.score_workers,
         )
         pipeline.run(
             entries, mode=args.mode, skip_train=not need_train,

@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--endpoint", default="/task/solve")
     parser.add_argument("--model", default="sii-holos/Qwen 3.5 397B A17B")
     parser.add_argument("--request-id", default="omb-memrl")
-    parser.add_argument("--timeout", type=int, default=240)
+    parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--step-limit", type=int, default=150)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")

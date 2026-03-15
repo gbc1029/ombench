@@ -51,3 +51,58 @@ def build_rubric_judge_prompt(
         "Rules: score = sum(weight for each met rubric). max_score = sum of positive weights."
     )
     return "\n".join(lines)
+
+
+def build_batch_rubric_judge_prompt(
+    *,
+    items: List[Dict[str, Any]],
+) -> str:
+    lines: List[str] = []
+    lines.append(
+        f"You will evaluate {len(items)} model response(s). "
+        "For EACH response, judge it against its rubrics independently."
+    )
+    lines.append("")
+
+    for idx, item in enumerate(items, start=1):
+        question = item.get("question", "")
+        response = item.get("response", "")
+        rubrics = item.get("rubrics", [])
+        sys_prompt = item.get("system_prompt")
+
+        lines.append(f"===== ITEM {idx} =====")
+        if sys_prompt:
+            lines.append("SYSTEM PROMPT:")
+            lines.append(sys_prompt)
+            lines.append("")
+
+        lines.append("QUESTION:")
+        lines.append(question)
+        lines.append("")
+
+        lines.append("MODEL RESPONSE:")
+        lines.append(response)
+        lines.append("")
+
+        lines.append("RUBRICS:")
+        for rubric in rubrics:
+            number = rubric.get("rubric_number")
+            weight = rubric.get("rubric_weight")
+            label = rubric.get("rubric_label", "")
+            detail = rubric.get("rubric_detail", "")
+            lines.append(f"- #{number} (weight {weight}) [{label}] {detail}")
+        lines.append("")
+
+    lines.append(
+        "Return a JSON array with one object per item, in order. Each object has the schema:\n"
+        "{\n"
+        "  \"rubric_results\": [\n"
+        "    {\"rubric_number\": <int>, \"weight\": <int>, \"met\": <true|false>, \"reason\": <string>}\n"
+        "  ],\n"
+        "  \"score\": <int>,\n"
+        "  \"max_score\": <int>\n"
+        "}\n"
+        "Rules: score = sum(weight for each met rubric). max_score = sum of positive weights.\n"
+        "Return ONLY the JSON array, no extra text."
+    )
+    return "\n".join(lines)

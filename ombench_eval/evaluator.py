@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-import json
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
-from ombench_eval.prompts import RUBRIC_JUDGE_SYSTEM_PROMPT, build_rubric_judge_prompt
+from ombench_eval.prompts import (
+    RUBRIC_JUDGE_SYSTEM_PROMPT,
+    build_batch_rubric_judge_prompt,
+    build_rubric_judge_prompt,
+)
 from ombench_eval.judge import BaseJudge
+
+logger = logging.getLogger(__name__)
 
 
 def _fallback_score(rubrics: List[Dict[str, Any]], results: Dict[str, Any]) -> Dict[str, Any]:
@@ -49,3 +56,72 @@ def score_response(
     if "score" in result and "max_score" in result:
         return result
     return _fallback_score(rubrics, result)
+
+
+def _score_batch_group(
+    judge: BaseJudge,
+    group: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if len(group) == 1:
+        item = group[0]
+        return [score_response(
+            judge=judge,
+            question=item.get("question", ""),
+            response=item.get("response", ""),
+            rubrics=item.get("rubrics", []),
+            system_prompt=item.get("system_prompt"),
+        )]
+
+    user_prompt = build_batch_rubric_judge_prompt(items=group)
+    raw_results = judge.judge_batch(RUBRIC_JUDGE_SYSTEM_PROMPT, user_prompt, expected_count=len(group))
+
+    scored: List[Dict[str, Any]] = []
+    for idx, raw in enumerate(raw_results):
+        if not isinstance(raw, dict):
+            scored.append({"raw": raw})
+            continue
+        if "score" in raw and "max_score" in raw:
+            scored.append(raw)
+        else:
+            rubrics = group[idx].get("rubrics", []) if idx < len(group) else []
+            scored.append(_fallback_score(rubrics, raw))
+    return scored
+
+
+def score_responses_batch(
+    *,
+    judge: BaseJudge,
+    items: List[Dict[str, Any]],
+    batch_size: int = 1,
+    max_workers: int = 4,
+) -> List[Dict[str, Any]]:
+    batch_size = max(batch_size, 1)
+    max_workers = max(max_workers, 1)
+
+    groups: List[List[Dict[str, Any]]] = []
+    for i in range(0, len(items), batch_size):
+        groups.append(items[i : i + batch_size])
+
+    all_results: List[Optional[List[Dict[str, Any]]]] = [None] * len(groups)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(_score_batch_group, judge, group): gidx
+            for gidx, group in enumerate(groups)
+        }
+        for future in as_completed(future_map):
+            gidx = future_map[future]
+            try:
+                all_results[gidx] = future.result()
+            except Exception as exc:
+                logger.error("Score batch group %d failed: %s", gidx, exc)
+                group = groups[gidx]
+                all_results[gidx] = [{"raw": str(exc)} for _ in group]
+
+    flat: List[Dict[str, Any]] = []
+    for group_result in all_results:
+        if group_result is not None:
+            flat.extend(group_result)
+        else:
+            flat.append({"raw": "missing"})
+    return flat

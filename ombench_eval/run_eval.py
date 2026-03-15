@@ -54,7 +54,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--endpoint", default="/task/solve")
     parser.add_argument("--model", default="sii-holos/Qwen 3.5 397B A17B")
     parser.add_argument("--judge-model", default="sii-holos/Qwen 3.5 397B A17B")
-    parser.add_argument("--timeout", type=int, default=240)
+    parser.add_argument("--timeout", type=int, default=1200,
+                        help="Timeout for generation requests (default: 1200)")
+    parser.add_argument("--judge-timeout", type=int, default=600,
+                        help="Timeout for scoring/judge requests (default: 600)")
     parser.add_argument("--step-limit", type=int, default=150)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -77,7 +80,7 @@ def main() -> None:
             base_url=args.base_url,
             endpoint=args.endpoint,
             model=args.judge_model,
-            timeout=args.timeout,
+            timeout=args.judge_timeout,
             step_limit=args.step_limit,
         ),
         dry_run=args.dry_run,

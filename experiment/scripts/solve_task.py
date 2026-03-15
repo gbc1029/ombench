@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark", default="onemillion")
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--model", default="sii-holos/Qwen 3.5 397B A17B")
-    parser.add_argument("--timeout", type=int, default=240)
+    parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--step-limit", type=int, default=150)
     parser.add_argument("--request-id", default="omb-probe-v2")
     parser.add_argument("--system-prompt", default="")

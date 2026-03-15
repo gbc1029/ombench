@@ -16,7 +16,7 @@ from bridge.dataset.onemillion_loader import load_entries
 from experiment.client.solver import SolveClient
 from experiment.config.settings import SolveSettings
 from experiment.prompt.onemillion_prompt import build_prompts
-from ombench_eval.evaluator import score_response
+from ombench_eval.evaluator import score_response, score_responses_batch
 from ombench_eval.judge import BaseJudge
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,8 @@ class BatchPipeline:
         dry_run: bool = False,
         max_retries: int = 1,
         output: Optional[Path] = None,
+        score_batch_size: int = 1,
+        score_workers: int = 4,
     ) -> None:
         self.client = client
         self.settings = settings
@@ -74,6 +76,8 @@ class BatchPipeline:
         self.dry_run = dry_run
         self.max_retries = max_retries
         self.output = output
+        self.score_batch_size = max(score_batch_size, 1)
+        self.score_workers = max(score_workers, 1)
 
     def _generate_one_direct(self, task_id: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         system_prompt, user_prompt = build_prompts(entry, include_rubrics=False)
@@ -171,26 +175,39 @@ class BatchPipeline:
         results: List[Dict[str, Any]],
         entries: Dict[str, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        scoreable = [(i, r) for i, r in enumerate(results) if r.get("answer") and not r.get("error")]
-        logger.info("Scoring responses: %d / %d tasks, %d workers", len(scoreable), len(results), self.workers)
+        scoreable_indices: List[int] = []
+        score_items: List[Dict[str, Any]] = []
+        for i, r in enumerate(results):
+            if r.get("answer") and not r.get("error"):
+                entry = entries.get(r["task_id"], {})
+                score_items.append({
+                    "question": entry.get("question", ""),
+                    "response": r.get("answer", ""),
+                    "rubrics": entry.get("rubrics", []),
+                    "system_prompt": entry.get("system_prompt"),
+                })
+                scoreable_indices.append(i)
 
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            future_map = {}
-            for idx, item in scoreable:
-                entry = entries.get(item["task_id"], {})
-                future_map[pool.submit(self._score_one, item, entry)] = idx
+        logger.info(
+            "Scoring responses: %d / %d tasks, batch_size=%d, workers=%d",
+            len(score_items), len(results), self.score_batch_size, self.score_workers,
+        )
 
-            with tqdm(total=len(future_map), desc="Score", unit="task") as pbar:
-                for future in as_completed(future_map):
-                    idx = future_map[future]
-                    try:
-                        results[idx] = future.result()
-                    except Exception as exc:
-                        logger.error("Task %s scoring failed: %s", results[idx].get("task_id"), exc)
-                        results[idx]["score"] = None
-                        results[idx]["error"] = str(exc)
-                        results[idx]["stage"] = "score"
-                    pbar.update(1)
+        if not score_items:
+            return results
+
+        batch_scores = score_responses_batch(
+            judge=self.judge,
+            items=score_items,
+            batch_size=self.score_batch_size,
+            max_workers=self.score_workers,
+        )
+
+        for pos, idx in enumerate(scoreable_indices):
+            if pos < len(batch_scores):
+                results[idx]["score"] = batch_scores[pos]
+            else:
+                results[idx]["score"] = None
 
         return results
 

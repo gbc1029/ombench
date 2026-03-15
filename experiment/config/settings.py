@@ -10,7 +10,7 @@ class SolveSettings:
     endpoint: str = "/task/solve"
     benchmark: str = "onemillion"
     model: str = "sii-holos/Qwen 3.5 397B A17B"
-    timeout: int = 240
+    timeout: int = 1200
     step_limit: int = 150
     request_id: str = "omb-probe-v2"
     system_prompt: str = ""
