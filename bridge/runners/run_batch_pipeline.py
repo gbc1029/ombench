@@ -12,7 +12,7 @@ from bridge.dataset.onemillion_loader import load_entries
 from bridge.runners.batch_pipeline import BatchPipeline
 from experiment.client.solver import SolveClient
 from experiment.config.settings import SolveSettings
-from ombench_eval.judge import JudgeSettings, SolveJudge
+from ombench_eval.judge import JudgeSettings, OpenAIJudge
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,8 +26,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default="http://10.245.198.39:8000")
     parser.add_argument("--endpoint", default="/task/solve")
     parser.add_argument("--model", default="sii-holos/Qwen 3.5 397B A17B")
-    parser.add_argument("--judge-model", default=None,
-                        help="Model for judging (defaults to --model)")
+    parser.add_argument("--judge-model", default="qwen3.5-397b-a17b",
+                        help="Model for judging (default: qwen3.5-397b-a17b)")
+    parser.add_argument("--judge-base-url", default="https://holos.openapi-qb.sii.edu.cn",
+                        help="Base URL for judge API (default: holos openapi)")
     parser.add_argument("--timeout", type=int, default=1200,
                         help="Timeout for generation requests (default: 1200)")
     parser.add_argument("--judge-timeout", type=int, default=600,
@@ -120,7 +122,7 @@ def main() -> None:
     )
 
     entries = load_entries(args.dataset_dir)
-    judge_model = args.judge_model or args.model
+    judge_model = args.judge_model
 
     client = SolveClient(
         base_url=args.base_url, endpoint=args.endpoint, timeout=args.timeout,
@@ -130,10 +132,10 @@ def main() -> None:
         model=args.model, timeout=args.timeout, step_limit=args.step_limit,
         request_id="omb-batch", system_prompt="", user_prompt="",
     )
-    judge = SolveJudge(
+    judge = OpenAIJudge(
         JudgeSettings(
-            base_url=args.base_url, endpoint=args.endpoint,
-            model=judge_model, timeout=args.judge_timeout, step_limit=args.step_limit,
+            base_url=args.judge_base_url,
+            model=judge_model, timeout=args.judge_timeout,
         ),
         dry_run=args.dry_run,
     )
