@@ -31,7 +31,15 @@ class SolveClient:
         self.headers = headers or {"Content-Type": "application/json"}
         self.timeout = timeout
 
-    def solve(self, payload: Dict[str, Any],timeout = self.timeout, *, dry_run: bool = False) -> Dict[str, Any]:
+    def solve(
+        self,
+        payload: Dict[str, Any],
+        timeout: Optional[int] = None,
+        *,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        if timeout is None:
+            timeout = self.timeout
         if dry_run:
             return {"status": "dry_run", "request": payload}
 
@@ -56,9 +64,10 @@ class SolveClient:
     ) -> Dict[str, Any]:
         last_exc: Optional[Exception] = None
         for attempt in range(max_retries + 1):
-            timeout = self.timeout if attempt == 0 else 2 * self.timeout
+            base_timeout = self.timeout if self.timeout is not None else None
+            timeout = base_timeout if attempt == 0 else (2 * base_timeout if base_timeout is not None else None)
             try:
-                return self.solve(payload,timeout = timeout, dry_run=dry_run)
+                return self.solve(payload, timeout=timeout, dry_run=dry_run)
             except Exception as exc:
                 last_exc = exc
                 if attempt < max_retries:
