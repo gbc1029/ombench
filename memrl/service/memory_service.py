@@ -1772,26 +1772,23 @@ class MemoryService:
         import os, json, re, shutil, sqlite3
         from memos.configs.mem_cube import GeneralMemCubeConfig
 
-        # 如果 snapshot_root 不是具体的 epoch 目录，则自动查找最大的 epoch
+        # 如果 snapshot_root 不是具体的 epoch 目录，则自动查找最新的子目录
         if os.path.isdir(snapshot_root) and not os.path.isfile(
             os.path.join(snapshot_root, "snapshot_meta.json")
         ):
-            # 检查是否有子目录是数字（epoch number）
             try:
-                epoch_dirs = []
-                for item in os.listdir(snapshot_root):
-                    item_path = os.path.join(snapshot_root, item)
-                    if os.path.isdir(item_path) and item.isdigit():
-                        epoch_dirs.append(int(item))
-
-                if epoch_dirs:
-                    max_epoch = max(epoch_dirs)
-                    snapshot_root = os.path.join(snapshot_root, str(max_epoch))
+                sub_dirs = [
+                    item for item in os.listdir(snapshot_root)
+                    if os.path.isdir(os.path.join(snapshot_root, item))
+                ]
+                if sub_dirs:
+                    latest = max(sub_dirs)
+                    snapshot_root = os.path.join(snapshot_root, latest)
                     logger.info(
-                        f"Auto-selected latest checkpoint: epoch {max_epoch} from {snapshot_root}"
+                        f"Auto-selected latest checkpoint: {latest} from {snapshot_root}"
                     )
             except Exception as e:
-                logger.warning(f"Failed to auto-detect epoch directory: {e}")
+                logger.warning(f"Failed to auto-detect checkpoint directory: {e}")
 
         # 解析路径
         meta_path = os.path.join(snapshot_root, "snapshot_meta.json")

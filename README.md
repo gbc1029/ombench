@@ -261,18 +261,36 @@ python -m bridge.runners.run_batch_pipeline --pipeline train
 ```bash
 python -m bridge.runners.run_batch_pipeline \
   --mode plain \
-  --resume-gen-score outputs/scored.jsonl \
-  --resume-train outputs/trained.jsonl
+  --resume-gen-score outputs/scored.jsonl
+
+# --resume-train 控制训练续跑：
+#   omit（默认）: 有 score 阶段时从头训练；仅 train 时自动续跑
+#   true:  跳过 trained-output 中已有的 task_id
+#   false: 清空 trained-output，从头训练
 ```
 
-### 分批训练（memrl）
+### 分批训练
 
-在 memrl 模式下，使用 `--gen-score-batch` 控制每批的 task 数量，每批完成后立即训练：
+使用 `--gen-score-batch` 控制每批的 task 数量，每批完成后立即训练。通过 `--batch-train false` 可关闭分批模式。
+
+- **memrl 模式**：每轮均使用记忆增强生成
+- **plain 模式**：第一轮使用纯生成（无记忆），后续轮次自动切换为 memrl 模式（使用前轮训练积累的记忆）
 
 ```bash
+# plain 模式分批训练（第一轮 plain，后续 memrl）
+python -m bridge.runners.run_batch_pipeline \
+  --mode plain --pipeline gen,score,train \
+  --gen-score-batch 50 --workers 4
+
+# memrl 模式分批训练
 python -m bridge.runners.run_batch_pipeline \
   --mode memrl --pipeline gen,score,train \
   --gen-score-batch 50 --workers 4
+
+# 关闭分批：全量生成+评分后再统一训练
+python -m bridge.runners.run_batch_pipeline \
+  --mode plain --pipeline gen,score,train \
+  --batch-train false --workers 4
 ```
 
 ### run_batch_pipeline 完整参数
@@ -299,7 +317,7 @@ python -m bridge.runners.run_batch_pipeline \
 | `--scored-output` | `outputs/scored.jsonl` | 评分结果输出 JSONL |
 | `--trained-output` | `outputs/trained.jsonl` | 训练记录输出 JSONL |
 | `--resume-gen-score` | 无 | 跳过已有的 gen/score task_id（JSONL 路径） |
-| `--resume-train` | 无 | 跳过已有的 train task_id（JSONL 路径） |
+| `--resume-train` | 无（自动） | 训练续跑控制：omit=自动 / `true`=跳过已训练 / `false`=从头训练 |
 | `--memory-context` | 无 | memrl 模式的记忆上下文文件（JSON/JSONL） |
 | `--train-base-url` | `https://holos.openapi-qb.sii.edu.cn` | 训练 LLM API 地址 |
 | `--train-endpoint` | `/v1/chat/completions` | 训练 LLM 端点 |
@@ -307,8 +325,9 @@ python -m bridge.runners.run_batch_pipeline \
 | `--train-api-key-env` | `INF_API_KEY` | 训练 API Key 环境变量名 |
 | `--checkpoint-dir` | `checkpoints/batch_pipeline` | 记忆 checkpoint 保存目录 |
 | `--checkpoint-every` | `100` | 每训练 N 条保存一次 checkpoint |
-| `--gen-score-batch` | `100` | 分批大小（memrl 模式 gen+score+train 循环） |
-| `--load-checkpoint` | 无 | 启动时加载指定 checkpoint 目录 |
+| `--gen-score-batch` | `100` | 分批大小（gen+score+train 循环） |
+| `--batch-train` | `true` | 是否启用分批 gen→score→train 循环（仅 pipeline=gen,score,train 生效） |
+| `--load-checkpoint` | 无 | 启动时加载指定 checkpoint 目录（仅 memrl 模式） |
 
 ### 汇总统计
 

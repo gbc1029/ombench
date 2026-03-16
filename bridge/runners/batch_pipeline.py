@@ -91,7 +91,7 @@ class BatchPipeline:
         self.max_retries = max_retries
         self.output = output
         self.score_workers = max(score_workers, 1)
-        self._checkpoint_seq = 0
+        self._checkpoint_ts_used: set[str] = set()
         self.generated_output = generated_output
         self.scored_output = scored_output
         self.trained_output = trained_output
@@ -475,8 +475,10 @@ class BatchPipeline:
     def _save_checkpoint(self, checkpoint_dir: Path) -> Optional[Dict[str, Any]]:
         if self.memory_service is None:
             return None
-        self._checkpoint_seq += 1
-        ckpt_id = f"{self._checkpoint_seq:06d}"
+        ckpt_id = time.strftime("%Y%m%d_%H%M%S")
+        while ckpt_id in self._checkpoint_ts_used:
+            ckpt_id += "_1"
+        self._checkpoint_ts_used.add(ckpt_id)
         try:
             return self.memory_service.save_checkpoint_snapshot(str(checkpoint_dir), ckpt_id)
         except Exception as exc:

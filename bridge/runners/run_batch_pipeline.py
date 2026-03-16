@@ -7,6 +7,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from bridge.dataset.onemillion_loader import load_entries
 from bridge.runners.batch_pipeline import BatchPipeline
@@ -63,6 +64,10 @@ def _parse_resume_train(value: str | None) -> str | None:
         "Use 'true' (resume from trained-output), 'false' (retrain from scratch), "
         "or omit to use the default behaviour."
     )
+
+
+def _parse_batch_train(value: str) -> bool:
+    return value.strip().lower() in ("true", "1", "yes")
 
 
 def parse_args() -> argparse.Namespace:
@@ -199,6 +204,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Load memory checkpoint before memrl generation",
     )
+    parser.add_argument(
+        "--batch-train",
+        default="true",
+        help=(
+            "Enable batched gen->score->train loop. "
+            "Only effective when pipeline=gen,score,train. "
+            "'true' (default): interleave batches; "
+            "'false': run gen+score for all tasks first, then train."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -312,14 +327,6 @@ def _iter_batches(
     return [tasks[i : i + batch_size] for i in range(0, len(tasks), batch_size)]
 
 
-def _get_existing_checkpoint_seq(checkpoint_dir: Path) -> int:
-    snapshot_root = checkpoint_dir / "snapshot"
-    if not snapshot_root.exists():
-        return 0
-    ids = [int(p.name) for p in snapshot_root.iterdir() if p.is_dir() and p.name.isdigit()]
-    return max(ids) if ids else 0
-
-
 def _resolve_latest_snapshot(checkpoint_dir: Path, load_checkpoint: Path | None) -> Path | None:
     if load_checkpoint:
         return load_checkpoint
@@ -329,10 +336,7 @@ def _resolve_latest_snapshot(checkpoint_dir: Path, load_checkpoint: Path | None)
     candidates = [p for p in snapshot_root.iterdir() if p.is_dir()]
     if not candidates:
         return None
-    numeric = [p for p in candidates if p.name.isdigit()]
-    if numeric:
-        return snapshot_root / str(max(int(p.name) for p in numeric))
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return max(candidates, key=lambda p: p.name)
 
 
 def _load_results(path: Path, name: str) -> list[dict[str, object]]:
@@ -449,7 +453,7 @@ def main() -> None:
 
     need_memory_service = args.mode == "memrl" or "train" in stages
     need_train = "train" in stages
-    memory_service = None
+    memory_service: Any = None
     temp_dir_ctx = None
 
     if need_memory_service:
@@ -509,7 +513,6 @@ def main() -> None:
             scored_output=args.scored_output if "score" in stages else None,
             trained_output=args.trained_output if need_train else None,
         )
-        pipeline._checkpoint_seq = _get_existing_checkpoint_seq(args.checkpoint_dir)
 
         if args.mode == "memrl" and memory_service is not None:
             snapshot_dir = _resolve_latest_snapshot(args.checkpoint_dir, args.load_checkpoint)
@@ -525,13 +528,15 @@ def main() -> None:
                     )
 
         # ---------------------------------------------------------------
-        # Batched memrl path: gen+score+train interleaved per batch
+        # Batched path: gen+score+train interleaved per batch
         # ---------------------------------------------------------------
+        batch_train = _parse_batch_train(args.batch_train)
+
         if {
             "gen",
             "score",
             "train",
-        }.issubset(stages) and args.mode == "memrl" and need_train:
+        }.issubset(stages) and batch_train and need_train:
             tasks = pipeline._build_tasks(entries, resume_gen_score)
             if len(tasks) > args.gen_score_batch:
                 all_results: list[dict[str, object]] = []
@@ -549,6 +554,23 @@ def main() -> None:
                 for idx, batch in enumerate(batches):
                     batch_idx = idx + 1
 
+                    # Determine generation mode for this batch
+                    if args.mode == "plain":
+                        gen_mode = "plain" if idx == 0 else "memrl"
+                    else:
+                        gen_mode = args.mode
+
+                    if args.mode == "plain" and idx == 0:
+                        _log.info(
+                            "Batch %d/%d: plain mode (no memory augmentation)",
+                            batch_idx, total_batches,
+                        )
+                    elif args.mode == "plain":
+                        _log.info(
+                            "Batch %d/%d: memrl mode (using accumulated memories)",
+                            batch_idx, total_batches,
+                        )
+
                     # After the first batch: clear output files and reset skip ids
                     # so each batch writes fresh; resume flags only apply to batch 1
                     if idx > 0:
@@ -559,7 +581,7 @@ def main() -> None:
 
                     batch_results = pipeline.generate_and_score_tasks(
                         batch,
-                        mode=args.mode,
+                        mode=gen_mode,
                         batch_idx=batch_idx,
                         total_batches=total_batches,
                         global_offset=global_gen_offset,
@@ -585,7 +607,7 @@ def main() -> None:
                         skip_train_ids.update(
                             {str(item.get("task_id")) for item in trained_records if item.get("task_id")}
                         )
-                    if last_checkpoint and args.mode == "memrl":
+                    if last_checkpoint and memory_service is not None:
                         snapshot_root = Path(last_checkpoint.get("cube_dir", "")).parent
                         if snapshot_root.exists():
                             try:
