@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 YES_VALUES = {"是", "Yes", "yes", "Y", "YES", "true", "True", "命中"}
 
-MAX_RETRIES = 3
+MAX_RETRIES = 2
 
 
 def _clean_and_parse_json(json_str: str) -> Any:

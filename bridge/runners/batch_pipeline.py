@@ -6,7 +6,7 @@ import random
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -369,56 +369,63 @@ class BatchPipeline:
                 )
 
             try:
-                for gen_future in as_completed(gen_futures):
-                    tid = gen_futures[gen_future]
-                    try:
-                        result = gen_future.result()
-                    except Exception as exc:
-                        logger.error("Task %s generation failed: %s", tid, exc)
-                        result = {
-                            "task_id": tid,
-                            "response": None,
-                            "answer": "",
-                            "error": str(exc),
-                            "stage": "generate",
-                            "score": None,
-                        }
+                pending: set = set(gen_futures.keys())
 
-                    self._append_jsonl(self.generated_output, self._format_generated(result))
-                    gen_done += 1
-                    bars[0].update(1)
-                    if total_batches > 1:
-                        bars[1].update(1)
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
 
-                    if result.get("answer") and not result.get("error"):
-                        entry = task_map.get(tid, {})
-                        sf = score_pool.submit(self._score_item, result, entry)
-                        score_futures[sf] = tid
-                    else:
-                        result["score"] = None
-                        results.append(result)
-                        self._append_jsonl(self.scored_output, self._format_scored(result))
-                        score_done += 1
-                        bars[score_bar_idx].update(1)
-                        if total_batches > 1:
-                            bars[score_bar_idx + 1].update(1)
+                    for future in done:
+                        if future in gen_futures:
+                            tid = gen_futures[future]
+                            try:
+                                result = future.result()
+                            except Exception as exc:
+                                logger.error("Task %s generation failed: %s", tid, exc)
+                                result = {
+                                    "task_id": tid,
+                                    "response": None,
+                                    "answer": "",
+                                    "error": str(exc),
+                                    "stage": "generate",
+                                    "score": None,
+                                }
 
-                for score_future in as_completed(score_futures):
-                    tid = score_futures[score_future]
-                    try:
-                        scored_result = score_future.result()
-                    except Exception as exc:
-                        logger.error("Task %s score failed: %s", tid, exc)
-                        scored_result = {
-                            "task_id": tid,
-                            "score": {"raw": str(exc)},
-                        }
-                    results.append(scored_result)
-                    self._append_jsonl(self.scored_output, self._format_scored(scored_result))
-                    score_done += 1
-                    bars[score_bar_idx].update(1)
-                    if total_batches > 1:
-                        bars[score_bar_idx + 1].update(1)
+                            self._append_jsonl(self.generated_output, self._format_generated(result))
+                            gen_done += 1
+                            bars[0].update(1)
+                            if total_batches > 1:
+                                bars[1].update(1)
+
+                            if result.get("answer") and not result.get("error"):
+                                entry = task_map.get(tid, {})
+                                sf = score_pool.submit(self._score_item, result, entry)
+                                score_futures[sf] = tid
+                                pending.add(sf)
+                            else:
+                                result["score"] = None
+                                results.append(result)
+                                self._append_jsonl(self.scored_output, self._format_scored(result))
+                                score_done += 1
+                                bars[score_bar_idx].update(1)
+                                if total_batches > 1:
+                                    bars[score_bar_idx + 1].update(1)
+
+                        elif future in score_futures:
+                            tid = score_futures[future]
+                            try:
+                                scored_result = future.result()
+                            except Exception as exc:
+                                logger.error("Task %s score failed: %s", tid, exc)
+                                scored_result = {
+                                    "task_id": tid,
+                                    "score": {"raw": str(exc)},
+                                }
+                            results.append(scored_result)
+                            self._append_jsonl(self.scored_output, self._format_scored(scored_result))
+                            score_done += 1
+                            bars[score_bar_idx].update(1)
+                            if total_batches > 1:
+                                bars[score_bar_idx + 1].update(1)
             finally:
                 for bar in bars:
                     bar.close()
