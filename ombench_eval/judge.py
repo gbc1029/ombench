@@ -334,6 +334,7 @@ class OpenAIJudge(BaseJudge):
 
     def judge(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         last_error: Optional[Exception] = None
+        last_answer_text: str = ""
         for attempt in range(MAX_RETRIES):
             try:
                 response = self._call_api(system_prompt, user_prompt)
@@ -343,16 +344,18 @@ class OpenAIJudge(BaseJudge):
                     logger.warning("Judge returned empty answer (attempt %d/%d)", attempt + 1, MAX_RETRIES)
                     continue
 
+                last_answer_text = answer_text
+
                 parsed_array = _extract_json_array(answer_text)
                 if parsed_array is not None:
-                    return {"rubric_array": parsed_array}
+                    return {"rubric_array": parsed_array, "raw_response": answer_text}
 
                 parsed_obj = _extract_json_object(answer_text)
                 if parsed_obj is not None:
                     arr = parsed_obj.get("rubric_results")
                     if isinstance(arr, list):
-                        return {"rubric_array": arr}
-                    return {"rubric_array": [], "raw": answer_text}
+                        return {"rubric_array": arr, "raw_response": answer_text}
+                    return {"rubric_array": [], "raw": answer_text, "raw_response": answer_text}
 
                 last_error = ValueError(f"Could not parse judge response as JSON array: {answer_text[:200]}")
                 logger.warning("JSON parse failed (attempt %d/%d): %s", attempt + 1, MAX_RETRIES, answer_text[:200])
@@ -361,7 +364,11 @@ class OpenAIJudge(BaseJudge):
                 last_error = exc
                 logger.warning("Judge API call failed (attempt %d/%d): %s", attempt + 1, MAX_RETRIES, exc)
 
-        return {"rubric_array": [], "raw": str(last_error) if last_error else "unknown error"}
+        return {
+            "rubric_array": [],
+            "raw": str(last_error) if last_error else "unknown error",
+            "raw_response": last_answer_text,
+        }
 
     def judge_batch(self, system_prompt: str, user_prompt: str, expected_count: int) -> List[Dict[str, Any]]:
         if expected_count == 1:
