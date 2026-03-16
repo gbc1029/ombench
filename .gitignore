@@ -16,6 +16,9 @@ venv/
 outputs/
 results/
 
+# Checkpoints
+checkpoints/
+
 # IDE
 .vscode/
 .idea/
