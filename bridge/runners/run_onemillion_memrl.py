@@ -205,7 +205,7 @@ def main() -> None:
                 metadata={
                     "task_id": task_id,
                     "request_id": response.get("request_id"),
-                    "status": status,
+                    "task_status": status,
                 },
             )
 

@@ -551,7 +551,7 @@ class BatchPipeline:
                             "request_id": response.get("request_id")
                             if isinstance(response, dict)
                             else None,
-                            "status": status,
+                            "task_status": status,
                             "score": score_info,
                         },
                     )
