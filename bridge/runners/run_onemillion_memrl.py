@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from bridge.adapters.hash_embedder import HashEmbedder
+from memrl.providers.embedding import LocalEmbedder
 from bridge.adapters.solve_llm import SolveLLM
 from bridge.dataset.onemillion_loader import load_entries
 from experiment.client.solver import SolveClient
@@ -158,7 +158,7 @@ def main() -> None:
         default_temperature=0.1,
         default_max_tokens=4096,
     )
-    embedder = HashEmbedder()
+    embedder = LocalEmbedder(model_name="all-MiniLM-L6-v2")
 
     with tempfile.TemporaryDirectory(prefix="onemillion_memrl_") as temp_dir:
         mos_config = _write_mos_config(

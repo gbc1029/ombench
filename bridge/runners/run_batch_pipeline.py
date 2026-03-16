@@ -8,12 +8,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from bridge.adapters.hash_embedder import HashEmbedder
 from bridge.dataset.onemillion_loader import load_entries
 from bridge.runners.batch_pipeline import BatchPipeline
 from experiment.client.solver import SolveClient
 from experiment.config.settings import SolveSettings, resolve_model_alias
 from experiment.prompt.onemillion_prompt import load_memory_context
+from memrl.providers.embedding import LocalEmbedder
 from memrl.providers.llm import OpenAILLM
 from ombench_eval.judge import JudgeSettings, OpenAIJudge
 
@@ -380,7 +380,7 @@ def main() -> None:
                 default_temperature=0.1,
                 default_max_tokens=4096,
             )
-            embedder = HashEmbedder()
+            embedder = LocalEmbedder(model_name="all-MiniLM-L6-v2")
             try:
                 memory_service = _build_memory_service(
                     args, train_llm, embedder, temp_dir, train_api_base=train_api_base,
