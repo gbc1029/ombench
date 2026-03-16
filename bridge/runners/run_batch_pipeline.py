@@ -28,8 +28,6 @@ def _resolve_openai_base_url(base_url: str, endpoint: str) -> str:
     return base
 
 
-
-
 def _build_log_path(log_dir: Path, log_file: Path | None) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     if log_file is None:
@@ -281,49 +279,6 @@ def _filter_results(results: list[dict[str, object]], skip_ids: set[str]) -> lis
     return [item for item in results if str(item.get("task_id")) not in skip_ids]
 
 
-def _format_generated(
-    results: list[dict[str, object]],
-    *,
-    dry_run: bool,
-) -> list[dict[str, object]]:
-    formatted = []
-    for item in results:
-        record = {
-            "task_id": item.get("task_id"),
-            "answer": item.get("answer"),
-            "error": item.get("error"),
-            "stage": item.get("stage"),
-            "system_prompt": item.get("system_prompt"),
-            "user_prompt": item.get("user_prompt"),
-        }
-        if not dry_run:
-            record["response"] = item.get("response")
-        formatted.append(record)
-    return formatted
-
-
-def _format_scored(
-    results: list[dict[str, object]],
-    *,
-    dry_run: bool,
-) -> list[dict[str, object]]:
-    formatted = []
-    for item in results:
-        record = {
-            "task_id": item.get("task_id"),
-            "answer": item.get("answer"),
-            "score": item.get("score"),
-            "error": item.get("error"),
-            "stage": item.get("stage"),
-            "system_prompt": item.get("system_prompt"),
-            "user_prompt": item.get("user_prompt"),
-        }
-        if not dry_run:
-            record["response"] = item.get("response")
-        formatted.append(record)
-    return formatted
-
-
 def _iter_batches(
     tasks: list[tuple[str, dict[str, object]]],
     batch_size: int,
@@ -449,6 +404,9 @@ def main() -> None:
             dry_run=args.dry_run,
             max_retries=args.max_retries,
             score_workers=args.score_workers,
+            generated_output=args.generated_output if "gen" in stages else None,
+            scored_output=args.scored_output if "score" in stages else None,
+            trained_output=args.trained_output if need_train else None,
         )
         pipeline._checkpoint_seq = _get_existing_checkpoint_seq(args.checkpoint_dir)
 
@@ -480,19 +438,25 @@ def main() -> None:
             if len(tasks) > args.gen_score_batch:
                 all_results: list[dict[str, object]] = []
                 batches = _iter_batches(tasks, args.gen_score_batch)
+                total_batches = len(batches)
+                global_total = len(tasks)
+                global_gen_offset = 0
+                global_train_offset = 0
+
+                pipeline.init_output_files(append=False)
+
                 for idx, batch in enumerate(batches):
-                    batch_results = pipeline.generate_and_score_tasks(batch, mode=args.mode)
+                    batch_idx = idx + 1
+                    batch_results = pipeline.generate_and_score_tasks(
+                        batch,
+                        mode=args.mode,
+                        batch_idx=batch_idx,
+                        total_batches=total_batches,
+                        global_offset=global_gen_offset,
+                        global_total=global_total,
+                    )
                     all_results.extend(batch_results)
-                    _write_jsonl(
-                        args.generated_output,
-                        _format_generated(batch_results, dry_run=args.dry_run),
-                        append=idx > 0,
-                    )
-                    _write_jsonl(
-                        args.scored_output,
-                        _format_scored(batch_results, dry_run=args.dry_run),
-                        append=idx > 0,
-                    )
+                    global_gen_offset += len(batch)
 
                     filtered = _filter_results(batch_results, skip_train_ids)
                     _, trained_records, last_checkpoint = pipeline.train(
@@ -501,9 +465,13 @@ def main() -> None:
                         checkpoint_dir=args.checkpoint_dir,
                         checkpoint_every=args.checkpoint_every,
                         save_final=True,
+                        batch_idx=batch_idx,
+                        total_batches=total_batches,
+                        global_offset=global_train_offset,
+                        global_total=global_total,
                     )
+                    global_train_offset += len(filtered)
                     if trained_records:
-                        _write_jsonl(args.trained_output, trained_records, append=True)
                         skip_train_ids.update(
                             {str(item.get("task_id")) for item in trained_records if item.get("task_id")}
                         )
@@ -521,39 +489,34 @@ def main() -> None:
                     pipeline.print_summary(all_results)
                 return
 
+        pipeline.init_output_files(append=False)
+
         if "gen" in stages and "score" in stages:
             results = pipeline.generate_and_score(entries, mode=args.mode, resume_from=resume_gen_score)
-            _write_jsonl(args.generated_output, _format_generated(results, dry_run=args.dry_run))
-            _write_jsonl(args.scored_output, _format_scored(results, dry_run=args.dry_run))
             if "score" in stages:
                 pipeline.print_summary(results)
             if need_train:
                 filtered = _filter_results(results, skip_train_ids)
-                _, trained_records, _ = pipeline.train(
+                pipeline.train(
                     filtered,
                     skip_ids=skip_train_ids,
                     checkpoint_dir=args.checkpoint_dir,
                     checkpoint_every=args.checkpoint_every,
                     save_final=True,
                 )
-                if trained_records:
-                    _write_jsonl(args.trained_output, trained_records, append=True)
             return
 
         if "gen" in stages and "score" not in stages:
             results = pipeline.generate(entries, mode=args.mode, resume_from=resume_gen_score)
-            _write_jsonl(args.generated_output, _format_generated(results, dry_run=args.dry_run))
             if need_train:
                 filtered = _filter_results(results, skip_train_ids)
-                _, trained_records, _ = pipeline.train(
+                pipeline.train(
                     filtered,
                     skip_ids=skip_train_ids,
                     checkpoint_dir=args.checkpoint_dir,
                     checkpoint_every=args.checkpoint_every,
                     save_final=True,
                 )
-                if trained_records:
-                    _write_jsonl(args.trained_output, trained_records, append=True)
             return
 
         if "score" in stages and "gen" not in stages:
@@ -562,35 +525,31 @@ def main() -> None:
             results = _load_results(args.generated_output, "Generated output")
             results = _filter_results(results, skip_gen_score_ids)
             scored = pipeline.score(results, entries)
-            _write_jsonl(args.scored_output, _format_scored(scored, dry_run=args.dry_run))
+            _write_jsonl(args.scored_output, scored)
             if "score" in stages:
                 pipeline.print_summary(scored)
             if "train" in stages and need_train:
                 filtered = _filter_results(scored, skip_train_ids)
-                _, trained_records, _ = pipeline.train(
+                pipeline.train(
                     filtered,
                     skip_ids=skip_train_ids,
                     checkpoint_dir=args.checkpoint_dir,
                     checkpoint_every=args.checkpoint_every,
                     save_final=True,
                 )
-                if trained_records:
-                    _write_jsonl(args.trained_output, trained_records, append=True)
             return
 
         if "train" in stages:
             scored = _load_results(args.scored_output, "Scored output")
             filtered = _filter_results(scored, skip_train_ids)
             if need_train:
-                _, trained_records, _ = pipeline.train(
+                pipeline.train(
                     filtered,
                     skip_ids=skip_train_ids,
                     checkpoint_dir=args.checkpoint_dir,
                     checkpoint_every=args.checkpoint_every,
                     save_final=True,
                 )
-                if trained_records:
-                    _write_jsonl(args.trained_output, trained_records, append=True)
             return
 
     finally:
@@ -600,4 +559,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

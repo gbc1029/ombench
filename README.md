@@ -71,10 +71,13 @@ python -m ombench_eval.run_eval --mode plain --dry-run
   "model": "qwen",
   "timeout": 1200,
   "step_limit": 150,
+  "include_task_prompt": false,
   "system_prompt": "string",
   "user_prompt": "string"
 }
 ```
+
+> **注意**：`include_task_prompt` 硬编码为 `false`，仅出现在生成模型（`/task/solve`）请求中。评分模型（`OpenAIJudge`，走 `/v1/chat/completions`）和训练用 LLM（`OpenAILLM`）不包含该字段。
 
 ### CLI 示例
 
@@ -187,20 +190,41 @@ python -m ombench_eval.run_eval \
 
 ## 批量管线（生成 → 打分 → 训练）
 
-批量管线将响应生成、rubric 打分和 MemRL 训练串联为一条自动化流水线，支持并发生成、逐条评分、失败重试和断点续跑。
+批量管线将响应生成、rubric 打分和 MemRL 训练串联为一条自动化流水线，支持并发生成、逐条评分、实时文件写入、失败重试和断点续跑。
 
 入口脚本：`bridge/runners/run_batch_pipeline.py`
 
 ### 三阶段流程
 
-1. **Generate**：从 dataset 批量构建 prompt 并发送到 `/task/solve`，`ThreadPoolExecutor` 并发
-2. **Score**：每条生成结果完成后立即发送到评分 API（`/v1/chat/completions`），按 `score_workers` 并发
-3. **Train**：将响应和分数写入 MemRL 记忆（串行，`MemoryService` 自管并发）
+1. **Generate**：从 dataset 批量构建 prompt 并发送到 `/task/solve`，`ThreadPoolExecutor` 并发。每生成一条结果**立即写入** `outputs/generated.jsonl`
+2. **Score**：每条生成结果完成后立即提交评分（`/v1/chat/completions`），按 `score_workers` 并发。每获得一条评分结果**立即写入** `outputs/scored.jsonl`
+3. **Train**：将响应和分数写入 MemRL 记忆（串行，`MemoryService` 自管并发）。每训练一条**立即写入** `outputs/trained.jsonl`
+
+### 实时写入行为
+
+批量管线支持**逐条实时写入**，中途中断不会丢失已完成结果：
+
+- `generated.jsonl`：每完成一条生成，立即追加写入
+- `scored.jsonl`：每完成一条评分，立即追加写入
+- `trained.jsonl`：每完成一条训练，立即追加写入
+- 新运行时覆盖已有文件；断点续跑（`--resume-*`）时自动跳过已完成的 task_id
+
+### 进度展示
+
+运行时在 stdout 显示各阶段的实时进度条：
+
+- 单批模式：`Generate: 45/100 [02:30<...]` `Score: 40/100 [01:20<...]` `Train: 38/100 [00:45<...]`
+- 分批模式（`--gen-score-batch`）：显示**当前批次进度** + **整体进度**
+  ```
+  Generate [batch 1/3]: 100/100  Overall Generate:  100/300
+  Score    [batch 1/3]: 100/100  Overall Score:     100/300
+  Train    [batch 1/3]:  95/100  Overall Train:      95/300
+  ```
 
 ### 基本用法
 
 ```bash
-# 默认：4 并发生成，4 并发评分
+# 默认：4 并发生成，4 并发评分，全部三阶段
 python -m bridge.runners.run_batch_pipeline \
   --mode plain --workers 4 --dry-run
 ```
@@ -209,19 +233,25 @@ python -m bridge.runners.run_batch_pipeline \
 
 - **plain**：只用 `question` 生成
 - **memrl**：`question + memory` 生成（需 `--memory-context`）
-- **rubric**：仅评分（需 `--responses-file`，不生成/不训练）
 
 ```bash
 python -m bridge.runners.run_batch_pipeline --mode plain --workers 4
 python -m bridge.runners.run_batch_pipeline --mode memrl --workers 4
 ```
 
-### 跳过训练阶段
+### 选择执行阶段
 
-仅生成响应 + 打分，不写入 MemRL 记忆：
+通过 `--pipeline` 控制执行哪些阶段（逗号分隔）：
 
 ```bash
-python -m bridge.runners.run_batch_pipeline --mode plain --no-train --workers 4
+# 仅生成 + 评分，跳过训练
+python -m bridge.runners.run_batch_pipeline --pipeline gen,score --workers 4
+
+# 仅评分（需已有 generated.jsonl）
+python -m bridge.runners.run_batch_pipeline --pipeline score
+
+# 仅训练（需已有 scored.jsonl）
+python -m bridge.runners.run_batch_pipeline --pipeline train
 ```
 
 ### 断点续跑
@@ -231,15 +261,26 @@ python -m bridge.runners.run_batch_pipeline --mode plain --no-train --workers 4
 ```bash
 python -m bridge.runners.run_batch_pipeline \
   --mode plain \
-  --output outputs/results.jsonl \
-  --resume outputs/results.jsonl
+  --resume-gen-score outputs/scored.jsonl \
+  --resume-train outputs/trained.jsonl
+```
+
+### 分批训练（memrl）
+
+在 memrl 模式下，使用 `--gen-score-batch` 控制每批的 task 数量，每批完成后立即训练：
+
+```bash
+python -m bridge.runners.run_batch_pipeline \
+  --mode memrl --pipeline gen,score,train \
+  --gen-score-batch 50 --workers 4
 ```
 
 ### run_batch_pipeline 完整参数
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--mode` | `plain` | 生成模式：`plain` / `memrl` / `rubric` |
+| `--mode` | `plain` | 生成模式：`plain` / `memrl` |
+| `--pipeline` | `gen,score,train` | 执行阶段（逗号分隔）：`gen` / `score` / `train` |
 | `--dataset-dir` | `datasets/OneMillion-Bench` | 数据集目录 |
 | `--base-url` | `http://10.245.198.39:8000` | 生成模型服务地址 |
 | `--endpoint` | `/task/solve` | 生成请求端点 |
@@ -253,10 +294,21 @@ python -m bridge.runners.run_batch_pipeline \
 | `--judge-timeout` | `600` | 评分请求超时（秒） |
 | `--score-workers` | `4` | 评分阶段并发数 |
 | `--limit` | `0` | 随机抽样任务数量（0 = 全部） |
-| `--no-train` | `false` | 跳过 MemRL 训练阶段 |
 | `--dry-run` | `false` | 不发送实际请求 |
-| `--output` | `outputs/results.jsonl` | 结果输出 JSONL 文件路径 |
-| `--resume` | 无 | 从之前的 JSONL 结果断点续跑 |
+| `--generated-output` | `outputs/generated.jsonl` | 生成结果输出 JSONL |
+| `--scored-output` | `outputs/scored.jsonl` | 评分结果输出 JSONL |
+| `--trained-output` | `outputs/trained.jsonl` | 训练记录输出 JSONL |
+| `--resume-gen-score` | 无 | 跳过已有的 gen/score task_id（JSONL 路径） |
+| `--resume-train` | 无 | 跳过已有的 train task_id（JSONL 路径） |
+| `--memory-context` | 无 | memrl 模式的记忆上下文文件（JSON/JSONL） |
+| `--train-base-url` | `https://holos.openapi-qb.sii.edu.cn` | 训练 LLM API 地址 |
+| `--train-endpoint` | `/v1/chat/completions` | 训练 LLM 端点 |
+| `--train-model` | `qwen3.5-397b-a17b` | 训练 LLM 模型 |
+| `--train-api-key-env` | `INF_API_KEY` | 训练 API Key 环境变量名 |
+| `--checkpoint-dir` | `checkpoints/batch_pipeline` | 记忆 checkpoint 保存目录 |
+| `--checkpoint-every` | `100` | 每训练 N 条保存一次 checkpoint |
+| `--gen-score-batch` | `100` | 分批大小（memrl 模式 gen+score+train 循环） |
+| `--load-checkpoint` | 无 | 启动时加载指定 checkpoint 目录 |
 
 ### 汇总统计
 
@@ -328,10 +380,10 @@ python -m bridge.runners.run_onemillion_memrl \
 | 文件 | 说明 |
 |---|---|
 | `experiment/client/solver.py` | HTTP 客户端封装（含重试） |
-| `experiment/config/settings.py` | 默认请求参数 + 覆盖 |
+| `experiment/config/settings.py` | 默认请求参数 + 覆盖（`include_task_prompt` 硬编码为 `false`） |
 | `bridge/adapters/solve_llm.py` | 将 `/task/solve` 适配为 MemRL 的 `BaseLLM` |
 | `bridge/adapters/hash_embedder.py` | 本地 hash embedder（避免远端 embedding 调用） |
-| `bridge/runners/batch_pipeline.py` | 批量管线核心（`BatchPipeline` 类） |
+| `bridge/runners/batch_pipeline.py` | 批量管线核心（`BatchPipeline` 类，实时写入 + 进度展示） |
 | `bridge/runners/run_batch_pipeline.py` | 批量管线 CLI 入口 |
 | `bridge/runners/run_onemillion_memrl.py` | 串行联动训练入口 |
 | `ombench_eval/evaluator.py` | 评分核心（`score_response` + `score_responses_batch`） |
@@ -345,3 +397,4 @@ python -m bridge.runners.run_onemillion_memrl \
 - 目前服务不可交互时，请务必使用 `--dry-run`
 - `memrl/` 目录保持原仓库结构不变，相关配置请按需修改
 - Qwen3.5 thinking 模式下 `content` 可能为 null，评分模块会自动从 `reasoning` 字段提取内容
+- 生成请求始终携带 `include_task_prompt: false`，该参数不传递给评分模型或训练 LLM

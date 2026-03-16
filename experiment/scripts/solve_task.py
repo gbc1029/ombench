@@ -20,7 +20,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-id", default="omb-probe-v2")
     parser.add_argument("--system-prompt", default="")
     parser.add_argument("--user-prompt", default="")
-    parser.add_argument("--include-task-prompt", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Do not send the request")
     parser.add_argument("--output", type=Path, default=Path("outputs/results.jsonl"))
     return parser.parse_args()
@@ -38,7 +37,6 @@ def main() -> None:
         request_id=args.request_id,
         system_prompt=args.system_prompt,
         user_prompt=args.user_prompt,
-        include_task_prompt=args.include_task_prompt if args.include_task_prompt else None,
         extra={"task_id": args.task_id},
     )
     client = SolveClient(base_url=args.base_url, endpoint=args.endpoint, timeout=args.timeout)

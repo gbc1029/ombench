@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import random
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
 
 from tqdm import tqdm
 
@@ -55,6 +55,12 @@ def _load_completed_ids(path: Path) -> set:
     return ids
 
 
+def _batch_desc(label: str, batch_idx: int, total_batches: int) -> str:
+    if total_batches <= 1:
+        return label
+    return f"{label} [batch {batch_idx}/{total_batches}]"
+
+
 class BatchPipeline:
     def __init__(
         self,
@@ -70,6 +76,9 @@ class BatchPipeline:
         max_retries: int = 1,
         output: Optional[Path] = None,
         score_workers: int = 4,
+        generated_output: Optional[Path] = None,
+        scored_output: Optional[Path] = None,
+        trained_output: Optional[Path] = None,
     ) -> None:
         self.client = client
         self.settings = settings
@@ -83,6 +92,57 @@ class BatchPipeline:
         self.output = output
         self.score_workers = max(score_workers, 1)
         self._checkpoint_seq = 0
+        self.generated_output = generated_output
+        self.scored_output = scored_output
+        self.trained_output = trained_output
+        self._write_lock = threading.Lock()
+        self._initialized_files: set[Path] = set()
+
+    def init_output_files(self, *, append: bool = False) -> None:
+        if append:
+            return
+        for path in (self.generated_output, self.scored_output, self.trained_output):
+            if path is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.open("w", encoding="utf-8").close()
+                self._initialized_files.add(path)
+
+    def _append_jsonl(self, path: Optional[Path], record: Dict[str, Any]) -> None:
+        if path is None:
+            return
+        with self._write_lock:
+            if path not in self._initialized_files:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self._initialized_files.add(path)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _format_generated(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "task_id": item.get("task_id"),
+            "answer": item.get("answer"),
+            "error": item.get("error"),
+            "stage": item.get("stage"),
+            "system_prompt": item.get("system_prompt"),
+            "user_prompt": item.get("user_prompt"),
+        }
+        if not self.dry_run:
+            record["response"] = item.get("response")
+        return record
+
+    def _format_scored(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "task_id": item.get("task_id"),
+            "answer": item.get("answer"),
+            "score": item.get("score"),
+            "error": item.get("error"),
+            "stage": item.get("stage"),
+            "system_prompt": item.get("system_prompt"),
+            "user_prompt": item.get("user_prompt"),
+        }
+        if not self.dry_run:
+            record["response"] = item.get("response")
+        return record
 
     def _score_item(self, item: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -123,7 +183,6 @@ class BatchPipeline:
             elif self.memory_context:
                 user_prompt = apply_memory(user_prompt, self.memory_context.get(task_id))
         return {"system_prompt": system_prompt, "user_prompt": user_prompt}
-
 
     def _generate_one_direct(
         self,
@@ -196,8 +255,13 @@ class BatchPipeline:
         tasks: List[tuple[str, Dict[str, Any]]],
         *,
         mode: str = "plain",
+        batch_idx: int = 1,
+        total_batches: int = 1,
+        global_offset: int = 0,
+        global_total: int = 0,
     ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
+        effective_global_total = global_total or len(tasks)
         logger.info(
             "Generating responses: %d tasks, %d workers, mode=%s",
             len(tasks),
@@ -210,7 +274,15 @@ class BatchPipeline:
                 pool.submit(self._generate_one_direct, tid, ent, mode=mode): tid
                 for tid, ent in tasks
             }
-            with tqdm(total=len(future_map), desc="Generate", unit="task") as pbar:
+            gen_desc = _batch_desc("Generate", batch_idx, total_batches)
+            bars = [
+                tqdm(total=len(future_map), desc=gen_desc, unit="task", position=0),
+            ]
+            if total_batches > 1:
+                bars.append(
+                    tqdm(total=effective_global_total, desc="Overall Generate", unit="task", initial=global_offset, position=1),
+                )
+            try:
                 for future in as_completed(future_map):
                     tid = future_map[future]
                     try:
@@ -218,16 +290,20 @@ class BatchPipeline:
                         results.append(result)
                     except Exception as exc:
                         logger.error("Task %s generation failed: %s", tid, exc)
-                        results.append(
-                            {
-                                "task_id": tid,
-                                "response": None,
-                                "answer": "",
-                                "error": str(exc),
-                                "stage": "generate",
-                            }
-                        )
-                    pbar.update(1)
+                        result = {
+                            "task_id": tid,
+                            "response": None,
+                            "answer": "",
+                            "error": str(exc),
+                            "stage": "generate",
+                        }
+                        results.append(result)
+                    self._append_jsonl(self.generated_output, self._format_generated(result))
+                    for bar in bars:
+                        bar.update(1)
+            finally:
+                for bar in bars:
+                    bar.close()
 
         return results
 
@@ -236,9 +312,14 @@ class BatchPipeline:
         tasks: List[tuple[str, Dict[str, Any]]],
         *,
         mode: str = "plain",
+        batch_idx: int = 1,
+        total_batches: int = 1,
+        global_offset: int = 0,
+        global_total: int = 0,
     ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         task_map = {task_id: entry for task_id, entry in tasks}
+        effective_global_total = global_total or len(tasks)
         logger.info(
             "Generating responses: %d tasks, %d workers, mode=%s",
             len(tasks),
@@ -251,19 +332,47 @@ class BatchPipeline:
             self.score_workers,
         )
 
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            future_map = {
-                pool.submit(self._generate_one_direct, tid, ent, mode=mode): tid
+        gen_desc = _batch_desc("Generate", batch_idx, total_batches)
+        score_desc = _batch_desc("Score", batch_idx, total_batches)
+
+        gen_done = 0
+        score_done = 0
+
+        with (
+            ThreadPoolExecutor(max_workers=self.workers) as gen_pool,
+            ThreadPoolExecutor(max_workers=self.score_workers) as score_pool,
+        ):
+            gen_futures = {
+                gen_pool.submit(self._generate_one_direct, tid, ent, mode=mode): tid
                 for tid, ent in tasks
             }
-            with (
-                tqdm(total=len(future_map), desc="Generate", unit="task") as gen_bar,
-                tqdm(total=len(future_map), desc="Score", unit="task") as score_bar,
-            ):
-                for future in as_completed(future_map):
-                    tid = future_map[future]
+            score_futures: Dict[Any, str] = {}
+
+            pos = 0
+            bars = [
+                tqdm(total=len(tasks), desc=gen_desc, unit="task", position=pos),
+            ]
+            pos += 1
+            if total_batches > 1:
+                bars.append(
+                    tqdm(total=effective_global_total, desc="Overall Generate", unit="task", initial=global_offset, position=pos),
+                )
+                pos += 1
+            score_bar_idx = len(bars)
+            bars.append(
+                tqdm(total=len(tasks), desc=score_desc, unit="task", position=pos),
+            )
+            pos += 1
+            if total_batches > 1:
+                bars.append(
+                    tqdm(total=effective_global_total, desc="Overall Score", unit="task", initial=global_offset, position=pos),
+                )
+
+            try:
+                for gen_future in as_completed(gen_futures):
+                    tid = gen_futures[gen_future]
                     try:
-                        result = future.result()
+                        result = gen_future.result()
                     except Exception as exc:
                         logger.error("Task %s generation failed: %s", tid, exc)
                         result = {
@@ -274,15 +383,45 @@ class BatchPipeline:
                             "stage": "generate",
                             "score": None,
                         }
+
+                    self._append_jsonl(self.generated_output, self._format_generated(result))
+                    gen_done += 1
+                    bars[0].update(1)
+                    if total_batches > 1:
+                        bars[1].update(1)
+
+                    if result.get("answer") and not result.get("error"):
+                        entry = task_map.get(tid, {})
+                        sf = score_pool.submit(self._score_item, result, entry)
+                        score_futures[sf] = tid
                     else:
-                        if result.get("answer") and not result.get("error"):
-                            entry = task_map.get(tid, {})
-                            result = self._score_item(result, entry)
-                        else:
-                            result["score"] = None
-                    results.append(result)
-                    gen_bar.update(1)
-                    score_bar.update(1)
+                        result["score"] = None
+                        results.append(result)
+                        self._append_jsonl(self.scored_output, self._format_scored(result))
+                        score_done += 1
+                        bars[score_bar_idx].update(1)
+                        if total_batches > 1:
+                            bars[score_bar_idx + 1].update(1)
+
+                for score_future in as_completed(score_futures):
+                    tid = score_futures[score_future]
+                    try:
+                        scored_result = score_future.result()
+                    except Exception as exc:
+                        logger.error("Task %s score failed: %s", tid, exc)
+                        scored_result = {
+                            "task_id": tid,
+                            "score": {"raw": str(exc)},
+                        }
+                    results.append(scored_result)
+                    self._append_jsonl(self.scored_output, self._format_scored(scored_result))
+                    score_done += 1
+                    bars[score_bar_idx].update(1)
+                    if total_batches > 1:
+                        bars[score_bar_idx + 1].update(1)
+            finally:
+                for bar in bars:
+                    bar.close()
 
         return results
 
@@ -313,7 +452,6 @@ class BatchPipeline:
             len(results),
             self.score_workers,
         )
-
 
         if not score_items:
             return results
@@ -353,6 +491,10 @@ class BatchPipeline:
         checkpoint_dir: Optional[Path] = None,
         checkpoint_every: int = 0,
         save_final: bool = True,
+        batch_idx: int = 1,
+        total_batches: int = 1,
+        global_offset: int = 0,
+        global_total: int = 0,
     ) -> tuple[int, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         if self.memory_service is None:
             logger.warning("No memory_service provided, skipping train stage")
@@ -363,54 +505,75 @@ class BatchPipeline:
         trained_records: List[Dict[str, Any]] = []
         last_checkpoint: Optional[Dict[str, Any]] = None
         skip_ids = skip_ids or set()
+        effective_global_total = global_total or len(results)
 
-        for item in tqdm(results, desc="Train", unit="task"):
-            task_id = item.get("task_id")
-            if task_id in skip_ids:
-                continue
-            if item.get("error") or not item.get("answer"):
-                continue
-            response = item.get("response", {})
-            status = response.get("status") if isinstance(response, dict) else None
-            trajectory = json.dumps(
-                response.get("session_data", {}).get("messages", [])
-                if isinstance(response, dict)
-                else [],
-                ensure_ascii=False,
+        train_desc = _batch_desc("Train", batch_idx, total_batches)
+        bars: List[Any] = [
+            tqdm(results, desc=train_desc, unit="task", position=0),
+        ]
+        if total_batches > 1:
+            bars.append(
+                tqdm(total=effective_global_total, desc="Overall Train", unit="task", initial=global_offset, position=1),
             )
-            score_info = item.get("score", {})
-            is_success = status == "completed"
-            if isinstance(score_info, dict) and score_info.get("max_score"):
-                ratio = score_info.get("score", 0) / score_info["max_score"]
-                is_success = is_success or ratio >= 0.5
 
-            try:
-                self.memory_service.add_memory(
-                    task_description=item.get("user_prompt", ""),
-                    trajectory=trajectory,
-                    success=is_success,
-                    metadata={
-                        "task_id": task_id,
-                        "request_id": response.get("request_id")
-                        if isinstance(response, dict)
-                        else None,
-                        "status": status,
-                        "score": score_info,
-                    },
+        try:
+            for item in bars[0]:
+                task_id = item.get("task_id")
+                if task_id in skip_ids:
+                    if total_batches > 1:
+                        bars[1].update(1)
+                    continue
+                if item.get("error") or not item.get("answer"):
+                    if total_batches > 1:
+                        bars[1].update(1)
+                    continue
+                response = item.get("response", {})
+                status = response.get("status") if isinstance(response, dict) else None
+                trajectory = json.dumps(
+                    response.get("session_data", {}).get("messages", [])
+                    if isinstance(response, dict)
+                    else [],
+                    ensure_ascii=False,
                 )
-                trained += 1
-                trained_records.append(
-                    {
+                score_info = item.get("score", {})
+                is_success = status == "completed"
+                if isinstance(score_info, dict) and score_info.get("max_score"):
+                    ratio = score_info.get("score", 0) / score_info["max_score"]
+                    is_success = is_success or ratio >= 0.5
+
+                try:
+                    self.memory_service.add_memory(
+                        task_description=item.get("user_prompt", ""),
+                        trajectory=trajectory,
+                        success=is_success,
+                        metadata={
+                            "task_id": task_id,
+                            "request_id": response.get("request_id")
+                            if isinstance(response, dict)
+                            else None,
+                            "status": status,
+                            "score": score_info,
+                        },
+                    )
+                    trained += 1
+                    record = {
                         "task_id": task_id,
                         "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     }
-                )
-                if checkpoint_dir and checkpoint_every > 0:
-                    if trained - last_saved >= checkpoint_every:
-                        last_checkpoint = self._save_checkpoint(checkpoint_dir)
-                        last_saved = trained
-            except Exception as exc:
-                logger.error("Task %s train failed: %s", task_id, exc)
+                    trained_records.append(record)
+                    self._append_jsonl(self.trained_output, record)
+                    if checkpoint_dir and checkpoint_every > 0:
+                        if trained - last_saved >= checkpoint_every:
+                            last_checkpoint = self._save_checkpoint(checkpoint_dir)
+                            last_saved = trained
+                except Exception as exc:
+                    logger.error("Task %s train failed: %s", task_id, exc)
+
+                if total_batches > 1:
+                    bars[1].update(1)
+        finally:
+            for bar in bars:
+                bar.close()
 
         if checkpoint_dir and save_final and trained > last_saved:
             last_checkpoint = self._save_checkpoint(checkpoint_dir)

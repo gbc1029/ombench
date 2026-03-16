@@ -30,7 +30,6 @@ class SolveOverrides:
     model: Optional[str] = None
     timeout: Optional[int] = None
     step_limit: Optional[int] = None
-    include_task_prompt: Optional[bool] = None
 
 
 class SolveLLM(BaseLLM):
@@ -62,7 +61,7 @@ class SolveLLM(BaseLLM):
             "user_prompt": user_prompt,
         }
         if overrides:
-            for key in ("request_id", "model", "timeout", "step_limit", "include_task_prompt"):
+            for key in ("request_id", "model", "timeout", "step_limit"):
                 value = getattr(overrides, key)
                 if value is not None:
                     override_payload[key] = value
@@ -78,7 +77,6 @@ class SolveLLM(BaseLLM):
             model=kwargs.get("model"),
             timeout=kwargs.get("timeout"),
             step_limit=kwargs.get("step_limit"),
-            include_task_prompt=kwargs.get("include_task_prompt"),
         )
         response = self.solve_raw(
             messages,
