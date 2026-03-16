@@ -11,7 +11,7 @@ from ombench_eval.prompts import (
     build_batch_rubric_judge_prompt,
     build_rubric_judge_prompt,
 )
-from ombench_eval.judge import BaseJudge
+from ombench_eval.judge import BaseJudge, convert_scores, parse_rubric_array
 
 logger = logging.getLogger(__name__)
 
@@ -21,28 +21,6 @@ def _is_timeout_error(exc: Exception) -> bool:
         return True
     message = str(exc).lower()
     return "timeout" in message or "timed out" in message
-
-
-def _fallback_score(rubrics: List[Dict[str, Any]], results: Dict[str, Any]) -> Dict[str, Any]:
-    rubric_results = results.get("rubric_results", []) if isinstance(results, dict) else []
-    if not isinstance(rubric_results, list):
-        rubric_results = []
-    weight_by_number = {r.get("rubric_number"): r.get("rubric_weight") for r in rubrics}
-    score = 0
-    max_score = 0
-    for rubric in rubrics:
-        weight = rubric.get("rubric_weight", 0)
-        if weight > 0:
-            max_score += weight
-    for item in rubric_results:
-        number = item.get("rubric_number")
-        met = item.get("met")
-        weight = item.get("weight")
-        if weight is None:
-            weight = weight_by_number.get(number, 0)
-        if met is True:
-            score += weight or 0
-    return {"rubric_results": rubric_results, "score": score, "max_score": max_score}
 
 
 def score_response(
@@ -61,10 +39,14 @@ def score_response(
     )
     result = judge.judge(RUBRIC_JUDGE_SYSTEM_PROMPT, user_prompt)
     if not isinstance(result, dict):
-        return {"raw": result}
-    if "score" in result and "max_score" in result:
-        return result
-    return _fallback_score(rubrics, result)
+        return {"rubric_results": [], "score": 0, "max_score": 0, "raw": result}
+
+    rubric_array = result.get("rubric_array")
+    if isinstance(rubric_array, list):
+        raw_results = parse_rubric_array(rubric_array, rubrics)
+        return convert_scores(raw_results, rubrics)
+
+    return {"rubric_results": [], "score": 0, "max_score": 0, "raw": result}
 
 
 def _score_batch_group(
@@ -87,13 +69,18 @@ def _score_batch_group(
     scored: List[Dict[str, Any]] = []
     for idx, raw in enumerate(raw_results):
         if not isinstance(raw, dict):
-            scored.append({"raw": raw})
+            scored.append({"rubric_results": [], "score": 0, "max_score": 0, "raw": raw})
             continue
-        if "score" in raw and "max_score" in raw:
-            scored.append(raw)
+
+        rubric_array = raw.get("rubric_array")
+        rubrics = group[idx].get("rubrics", []) if idx < len(group) else []
+
+        if isinstance(rubric_array, list) and rubric_array:
+            parsed = parse_rubric_array(rubric_array, rubrics)
+            scored.append(convert_scores(parsed, rubrics))
         else:
-            rubrics = group[idx].get("rubrics", []) if idx < len(group) else []
-            scored.append(_fallback_score(rubrics, raw))
+            scored.append({"rubric_results": [], "score": 0, "max_score": 0, "raw": raw})
+
     return scored
 
 
@@ -146,7 +133,10 @@ def score_responses_batch(
                             )
                         else:
                             logger.warning("Score timeout for task_ids: unknown")
-                    all_results[gidx] = [{"raw": str(exc)} for _ in group]
+                    all_results[gidx] = [
+                        {"rubric_results": [], "score": 0, "max_score": 0, "raw": str(exc)}
+                        for _ in group
+                    ]
                 finally:
                     if progress is not None:
                         progress.update(1)
@@ -159,5 +149,5 @@ def score_responses_batch(
         if group_result is not None:
             flat.extend(group_result)
         else:
-            flat.append({"raw": "missing"})
+            flat.append({"rubric_results": [], "score": 0, "max_score": 0, "raw": "missing"})
     return flat
