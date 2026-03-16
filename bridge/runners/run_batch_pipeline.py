@@ -20,6 +20,8 @@ from ombench_eval.judge import JudgeSettings, OpenAIJudge
 DEFAULT_TRAIN_BASE_URL = "https://holos.openapi-qb.sii.edu.cn"
 DEFAULT_TRAIN_ENDPOINT = "/v1/chat/completions"
 
+_log = logging.getLogger(__name__)
+
 
 def _resolve_openai_base_url(base_url: str, endpoint: str) -> str:
     base = base_url.rstrip("/")
@@ -46,6 +48,21 @@ def _parse_pipeline(value: str) -> set[str]:
     if invalid:
         raise SystemExit(f"Unsupported pipeline stage(s): {', '.join(sorted(invalid))}")
     return stages
+
+
+def _parse_resume_train(value: str | None) -> str | None:
+    if value is None:
+        return None
+    low = value.strip().lower()
+    if low in ("true", "1", "yes"):
+        return "true"
+    if low in ("false", "0", "no"):
+        return "false"
+    raise SystemExit(
+        f"Invalid --resume-train value: {value!r}. "
+        "Use 'true' (resume from trained-output), 'false' (retrain from scratch), "
+        "or omit to use the default behaviour."
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,9 +167,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--resume-train",
-        type=Path,
         default=None,
-        help="Skip already-trained task_ids from this JSONL",
+        help=(
+            "Control train-stage resume behaviour. "
+            "Omit: auto (train-only resumes from trained-output; with score stage retrains from scratch). "
+            "'true': always resume, skip task_ids already in trained-output. "
+            "'false': always retrain from scratch (clear trained-output)."
+        ),
     )
     parser.add_argument(
         "--checkpoint-dir",
@@ -273,6 +294,11 @@ def _load_completed_ids(path: Path) -> set[str]:
     }
 
 
+def _clear_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.open("w", encoding="utf-8").close()
+
+
 def _filter_results(results: list[dict[str, object]], skip_ids: set[str]) -> list[dict[str, object]]:
     if not skip_ids:
         return results
@@ -315,9 +341,68 @@ def _load_results(path: Path, name: str) -> list[dict[str, object]]:
     return _load_jsonl(path)
 
 
+# ---------------------------------------------------------------------------
+# Resume-train logic
+# ---------------------------------------------------------------------------
+
+def _resolve_train_resume(
+    resume_train: str | None,
+    stages: set[str],
+    trained_output: Path,
+) -> tuple[bool, set[str]]:
+    """Determine whether to clear trained_output and which ids to skip.
+
+    Returns (should_clear_trained, skip_train_ids).
+    """
+    has_score = "score" in stages
+    has_train = "train" in stages
+
+    if not has_train:
+        if resume_train is not None:
+            _log.warning(
+                "--resume-train is ignored because pipeline does not include 'train'",
+            )
+        return False, set()
+
+    if resume_train == "false":
+        if not has_score:
+            _log.warning(
+                "--resume-train=false without a score stage: "
+                "training from existing scored-output without dedup — "
+                "if the scored data overlaps with previous training, "
+                "those samples will receive extra weight (trained twice)."
+            )
+        return True, set()
+
+    if resume_train == "true":
+        if has_score:
+            _log.warning(
+                "--resume-train=true with a score stage: "
+                "tasks already in trained-output will be skipped even if "
+                "they were re-scored in this run. "
+                "Newly scored data whose task_id already appears in "
+                "trained-output will NOT participate in training."
+            )
+        skip = _load_completed_ids(trained_output)
+        return False, skip
+
+    # resume_train is None — auto mode
+    if has_score:
+        return True, set()
+    else:
+        skip = _load_completed_ids(trained_output)
+        return False, skip
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     args = parse_args()
     stages = _parse_pipeline(args.pipeline)
+    resume_train = _parse_resume_train(args.resume_train)
+
     log_path = _build_log_path(args.log_dir, args.log_file)
     handlers = [logging.FileHandler(log_path), logging.StreamHandler()]
     logging.basicConfig(
@@ -325,7 +410,15 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=handlers,
     )
-    logging.getLogger(__name__).info("Logging to %s", log_path)
+    _log.info("Logging to %s", log_path)
+
+    # --- Validate pipeline combinations ---
+    if "gen" in stages and "train" in stages and "score" not in stages:
+        raise SystemExit(
+            "Pipeline 'gen,train' (without score) is not allowed. "
+            "Training requires scored data to determine success/failure. "
+            "Use 'gen,score,train' or run scoring separately first."
+        )
 
     need_entries = "gen" in stages or "score" in stages
     entries = load_entries(args.dataset_dir) if need_entries else {}
@@ -362,7 +455,7 @@ def main() -> None:
     if need_memory_service:
         train_api_key = os.environ.get(args.train_api_key_env, "")
         if not train_api_key:
-            logging.getLogger(__name__).warning(
+            _log.warning(
                 "Training API key missing (%s); memory features disabled",
                 args.train_api_key_env,
             )
@@ -386,11 +479,19 @@ def main() -> None:
                     args, train_llm, embedder, temp_dir, train_api_base=train_api_base,
                 )
             except Exception as exc:
-                logging.getLogger(__name__).warning(
+                _log.warning(
                     "Failed to init MemoryService (%s); memory features disabled",
                     exc,
                 )
                 need_train = False
+
+    # --- Resolve resume-train ---
+    should_clear_trained, skip_train_ids = _resolve_train_resume(
+        resume_train, stages, args.trained_output,
+    )
+
+    resume_gen_score = args.resume_gen_score
+    skip_gen_score_ids = _load_completed_ids(resume_gen_score) if resume_gen_score else set()
 
     try:
         pipeline = BatchPipeline(
@@ -415,20 +516,17 @@ def main() -> None:
             if snapshot_dir:
                 try:
                     memory_service.load_checkpoint_snapshot(str(snapshot_dir))
-                    logging.getLogger(__name__).info(
+                    _log.info(
                         "Loaded checkpoint snapshot from %s", snapshot_dir,
                     )
                 except Exception as exc:
-                    logging.getLogger(__name__).warning(
+                    _log.warning(
                         "Failed to load checkpoint snapshot (%s)", exc,
                     )
 
-        resume_gen_score = args.resume_gen_score
-        skip_gen_score_ids = _load_completed_ids(resume_gen_score) if resume_gen_score else set()
-
-        resume_train_path = args.resume_train or args.trained_output
-        skip_train_ids = _load_completed_ids(resume_train_path) if resume_train_path.exists() else set()
-
+        # ---------------------------------------------------------------
+        # Batched memrl path: gen+score+train interleaved per batch
+        # ---------------------------------------------------------------
         if {
             "gen",
             "score",
@@ -443,10 +541,22 @@ def main() -> None:
                 global_gen_offset = 0
                 global_train_offset = 0
 
+                # First batch: honour resume flags, clear files that need clearing
+                if should_clear_trained:
+                    _clear_file(args.trained_output)
                 pipeline.init_output_files(append=False)
 
                 for idx, batch in enumerate(batches):
                     batch_idx = idx + 1
+
+                    # After the first batch: clear output files and reset skip ids
+                    # so each batch writes fresh; resume flags only apply to batch 1
+                    if idx > 0:
+                        _clear_file(args.generated_output)
+                        _clear_file(args.scored_output)
+                        _clear_file(args.trained_output)
+                        skip_train_ids = set()
+
                     batch_results = pipeline.generate_and_score_tasks(
                         batch,
                         mode=args.mode,
@@ -481,7 +591,7 @@ def main() -> None:
                             try:
                                 memory_service.load_checkpoint_snapshot(str(snapshot_root))
                             except Exception as exc:
-                                logging.getLogger(__name__).warning(
+                                _log.warning(
                                     "Failed to reload checkpoint (%s)", exc,
                                 )
 
@@ -489,12 +599,19 @@ def main() -> None:
                     pipeline.print_summary(all_results)
                 return
 
+        # ---------------------------------------------------------------
+        # Non-batched paths
+        # ---------------------------------------------------------------
+
+        # Clear trained-output upfront when needed
+        if should_clear_trained and need_train:
+            _clear_file(args.trained_output)
+
         pipeline.init_output_files(append=False)
 
         if "gen" in stages and "score" in stages:
             results = pipeline.generate_and_score(entries, mode=args.mode, resume_from=resume_gen_score)
-            if "score" in stages:
-                pipeline.print_summary(results)
+            pipeline.print_summary(results)
             if need_train:
                 filtered = _filter_results(results, skip_train_ids)
                 pipeline.train(
@@ -508,15 +625,6 @@ def main() -> None:
 
         if "gen" in stages and "score" not in stages:
             results = pipeline.generate(entries, mode=args.mode, resume_from=resume_gen_score)
-            if need_train:
-                filtered = _filter_results(results, skip_train_ids)
-                pipeline.train(
-                    filtered,
-                    skip_ids=skip_train_ids,
-                    checkpoint_dir=args.checkpoint_dir,
-                    checkpoint_every=args.checkpoint_every,
-                    save_final=True,
-                )
             return
 
         if "score" in stages and "gen" not in stages:
@@ -526,9 +634,8 @@ def main() -> None:
             results = _filter_results(results, skip_gen_score_ids)
             scored = pipeline.score(results, entries)
             _write_jsonl(args.scored_output, scored)
-            if "score" in stages:
-                pipeline.print_summary(scored)
-            if "train" in stages and need_train:
+            pipeline.print_summary(scored)
+            if need_train:
                 filtered = _filter_results(scored, skip_train_ids)
                 pipeline.train(
                     filtered,

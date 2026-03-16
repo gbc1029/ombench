@@ -204,6 +204,7 @@ def convert_scores(
 ) -> Dict[str, Any]:
     score = 0
     max_score = 0
+    has_valid = False
     rubric_results: List[Dict[str, Any]] = []
 
     for rubric in rubrics:
@@ -231,6 +232,7 @@ def convert_scores(
             })
             continue
 
+        has_valid = True
         met = bs == 1
         if met:
             score += weight
@@ -241,6 +243,9 @@ def convert_scores(
             "met": met,
             "reason": raw.get("justification", ""),
         })
+
+    if not has_valid:
+        max_score = 0
 
     return {
         "rubric_results": rubric_results,
