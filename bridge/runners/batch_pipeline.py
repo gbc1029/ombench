@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -81,6 +82,7 @@ class BatchPipeline:
         self.max_retries = max_retries
         self.output = output
         self.score_workers = max(score_workers, 1)
+        self._checkpoint_seq = 0
 
     def _score_item(self, item: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -108,8 +110,20 @@ class BatchPipeline:
     ) -> Dict[str, str]:
         system_prompt, user_prompt = build_plain_prompts(entry)
         if mode == "memrl":
-            user_prompt = apply_memory(user_prompt, self.memory_context.get(task_id))
+            if self.memory_service is not None:
+                try:
+                    retrieval = self.memory_service.retrieve_value_aware(user_prompt)
+                    selected = retrieval.get("selected") if isinstance(retrieval, dict) else None
+                    memory_text = None
+                    if isinstance(selected, dict):
+                        memory_text = selected.get("content")
+                    user_prompt = apply_memory(user_prompt, memory_text)
+                except Exception as exc:
+                    logger.warning("Memory retrieval failed for %s: %s", task_id, exc)
+            elif self.memory_context:
+                user_prompt = apply_memory(user_prompt, self.memory_context.get(task_id))
         return {"system_prompt": system_prompt, "user_prompt": user_prompt}
+
 
     def _generate_one_direct(
         self,
@@ -137,13 +151,11 @@ class BatchPipeline:
             "user_prompt": prompts["user_prompt"],
         }
 
-    def generate(
+    def _build_tasks(
         self,
         entries: Dict[str, Dict[str, Any]],
-        *,
-        mode: str = "plain",
-        resume_from: Optional[Path] = None,
-    ) -> List[Dict[str, Any]]:
+        resume_from: Optional[Path],
+    ) -> List[tuple[str, Dict[str, Any]]]:
         skip_ids = _load_completed_ids(resume_from) if resume_from else set()
         if skip_ids:
             logger.info("Resuming: skipping %d already-completed task(s)", len(skip_ids))
@@ -157,7 +169,34 @@ class BatchPipeline:
             random.shuffle(tasks)
         if self.limit:
             tasks = tasks[: self.limit]
+        return tasks
 
+    def generate(
+        self,
+        entries: Dict[str, Dict[str, Any]],
+        *,
+        mode: str = "plain",
+        resume_from: Optional[Path] = None,
+    ) -> List[Dict[str, Any]]:
+        tasks = self._build_tasks(entries, resume_from)
+        return self.generate_tasks(tasks, mode=mode)
+
+    def generate_and_score(
+        self,
+        entries: Dict[str, Dict[str, Any]],
+        *,
+        mode: str = "plain",
+        resume_from: Optional[Path] = None,
+    ) -> List[Dict[str, Any]]:
+        tasks = self._build_tasks(entries, resume_from)
+        return self.generate_and_score_tasks(tasks, mode=mode)
+
+    def generate_tasks(
+        self,
+        tasks: List[tuple[str, Dict[str, Any]]],
+        *,
+        mode: str = "plain",
+    ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         logger.info(
             "Generating responses: %d tasks, %d workers, mode=%s",
@@ -192,28 +231,14 @@ class BatchPipeline:
 
         return results
 
-    def generate_and_score(
+    def generate_and_score_tasks(
         self,
-        entries: Dict[str, Dict[str, Any]],
+        tasks: List[tuple[str, Dict[str, Any]]],
         *,
         mode: str = "plain",
-        resume_from: Optional[Path] = None,
     ) -> List[Dict[str, Any]]:
-        skip_ids = _load_completed_ids(resume_from) if resume_from else set()
-        if skip_ids:
-            logger.info("Resuming: skipping %d already-completed task(s)", len(skip_ids))
-
-        tasks = [
-            (task_id, entry)
-            for task_id, entry in entries.items()
-            if task_id not in skip_ids
-        ]
-        if tasks:
-            random.shuffle(tasks)
-        if self.limit:
-            tasks = tasks[: self.limit]
-
         results: List[Dict[str, Any]] = []
+        task_map = {task_id: entry for task_id, entry in tasks}
         logger.info(
             "Generating responses: %d tasks, %d workers, mode=%s",
             len(tasks),
@@ -251,7 +276,7 @@ class BatchPipeline:
                         }
                     else:
                         if result.get("answer") and not result.get("error"):
-                            entry = entries.get(tid, {})
+                            entry = task_map.get(tid, {})
                             result = self._score_item(result, entry)
                         else:
                             result["score"] = None
@@ -309,13 +334,40 @@ class BatchPipeline:
 
         return results
 
-    def train(self, results: List[Dict[str, Any]]) -> int:
+    def _save_checkpoint(self, checkpoint_dir: Path) -> Optional[Dict[str, Any]]:
+        if self.memory_service is None:
+            return None
+        self._checkpoint_seq += 1
+        ckpt_id = f"{self._checkpoint_seq:06d}"
+        try:
+            return self.memory_service.save_checkpoint_snapshot(str(checkpoint_dir), ckpt_id)
+        except Exception as exc:
+            logger.warning("Failed to save checkpoint %s: %s", ckpt_id, exc)
+            return None
+
+    def train(
+        self,
+        results: List[Dict[str, Any]],
+        *,
+        skip_ids: Optional[set] = None,
+        checkpoint_dir: Optional[Path] = None,
+        checkpoint_every: int = 0,
+        save_final: bool = True,
+    ) -> tuple[int, List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         if self.memory_service is None:
             logger.warning("No memory_service provided, skipping train stage")
-            return 0
+            return 0, [], None
 
         trained = 0
+        last_saved = 0
+        trained_records: List[Dict[str, Any]] = []
+        last_checkpoint: Optional[Dict[str, Any]] = None
+        skip_ids = skip_ids or set()
+
         for item in tqdm(results, desc="Train", unit="task"):
+            task_id = item.get("task_id")
+            if task_id in skip_ids:
+                continue
             if item.get("error") or not item.get("answer"):
                 continue
             response = item.get("response", {})
@@ -338,7 +390,7 @@ class BatchPipeline:
                     trajectory=trajectory,
                     success=is_success,
                     metadata={
-                        "task_id": item["task_id"],
+                        "task_id": task_id,
                         "request_id": response.get("request_id")
                         if isinstance(response, dict)
                         else None,
@@ -347,11 +399,24 @@ class BatchPipeline:
                     },
                 )
                 trained += 1
+                trained_records.append(
+                    {
+                        "task_id": task_id,
+                        "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    }
+                )
+                if checkpoint_dir and checkpoint_every > 0:
+                    if trained - last_saved >= checkpoint_every:
+                        last_checkpoint = self._save_checkpoint(checkpoint_dir)
+                        last_saved = trained
             except Exception as exc:
-                logger.error("Task %s train failed: %s", item["task_id"], exc)
+                logger.error("Task %s train failed: %s", task_id, exc)
+
+        if checkpoint_dir and save_final and trained > last_saved:
+            last_checkpoint = self._save_checkpoint(checkpoint_dir)
 
         logger.info("Trained %d / %d tasks", trained, len(results))
-        return trained
+        return trained, trained_records, last_checkpoint
 
     def _save_results(self, results: List[Dict[str, Any]]) -> None:
         if not self.output:

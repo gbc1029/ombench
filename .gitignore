@@ -27,3 +27,4 @@ Thumbs.db
 # else
 # Egg info
 *.egg-info/
+holos_synergy_repo.egg-info/
