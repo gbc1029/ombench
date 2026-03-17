@@ -192,7 +192,10 @@ def parse_args() -> argparse.Namespace:
         "--gen-score-batch",
         type=int,
         default=100,
-        help="Batch size for generate+score in memrl (default: 100)",
+        help=(
+            "Batch size for gen+score+train pipeline (default: 100). "
+            "Set to 0 to disable batching (process all tasks in one pass)."
+        ),
     )
     parser.add_argument(
         "--load-checkpoint",
@@ -540,7 +543,7 @@ def main() -> None:
                 _clear_file(args.trained_output)
             pipeline.init_output_files(append=False)
 
-            if len(tasks) > args.gen_score_batch:
+            if args.gen_score_batch > 0 and len(tasks) > args.gen_score_batch:
                 all_results: list[dict[str, object]] = []
                 all_trained: list[dict[str, object]] = []
                 batches = _iter_batches(tasks, args.gen_score_batch)
