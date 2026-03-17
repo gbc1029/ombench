@@ -156,6 +156,8 @@ class BatchPipeline:
                 rubrics=entry.get("rubrics", []),
                 system_prompt=entry.get("system_prompt"),
             )
+            if isinstance(score, dict) and score.get("raw") in ("single_rubric_object", "incomplete_rubric_array"):
+                logger.warning("Task %s score parse incomplete: %s", item.get("task_id"), score.get("raw"))
             item["score"] = score
         except Exception as exc:
             if _is_timeout_error(exc):

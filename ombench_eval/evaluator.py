@@ -45,6 +45,15 @@ def score_response(
 
     rubric_array = result.get("rubric_array")
     if isinstance(rubric_array, list):
+        if len(rubric_array) < len(rubrics):
+            raw = raw_error or "incomplete_rubric_array"
+            return {
+                "rubric_results": [],
+                "score": 0,
+                "max_score": 0,
+                "raw": raw,
+                "raw_response": raw_response,
+            }
         raw_results = parse_rubric_array(rubric_array, rubrics)
         scores = convert_scores(raw_results, rubrics)
         scores["raw_response"] = raw_response

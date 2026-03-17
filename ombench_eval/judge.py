@@ -315,7 +315,6 @@ class OpenAIJudge(BaseJudge):
             "messages": messages,
             "max_tokens": self.settings.max_tokens,
             "temperature": 0.1,
-            "response_format": {"type": "json_object"},
         }
         if self.dry_run:
             return {"choices": [{"message": {"content": "[]"}}]}
@@ -371,7 +370,11 @@ class OpenAIJudge(BaseJudge):
                     if isinstance(arr, list):
                         return {"rubric_array": arr, "raw_response": answer_text}
                     if parsed_obj.get("rubric_id") is not None:
-                        return {"rubric_array": [parsed_obj], "raw_response": answer_text}
+                        return {
+                            "rubric_array": [],
+                            "raw": "single_rubric_object",
+                            "raw_response": answer_text,
+                        }
                     return {"rubric_array": [], "raw": answer_text, "raw_response": answer_text}
 
                 last_error = ValueError(f"Could not parse judge response as JSON array: {answer_text[:200]}")
