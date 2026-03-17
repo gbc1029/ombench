@@ -28,6 +28,20 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timeout" in message or "timed out" in message
 
 
+def _is_gen_timeout(result: Dict[str, Any]) -> bool:
+    resp = result.get("response")
+    if isinstance(resp, dict) and resp.get("status") == "timeout":
+        return True
+    return False
+
+
+def _is_score_timeout(item: Dict[str, Any]) -> bool:
+    score = item.get("score")
+    if isinstance(score, dict) and score.get("error_type") == "timeout":
+        return True
+    return False
+
+
 def _extract_answer(response: Dict[str, Any]) -> str:
     if not isinstance(response, dict):
         return ""
@@ -125,6 +139,7 @@ class BatchPipeline:
             "task_id": item.get("task_id"),
             "answer": item.get("answer"),
             "error": item.get("error"),
+            "error_type": item.get("error_type"),
             "stage": item.get("stage"),
             "system_prompt": item.get("system_prompt"),
             "user_prompt": item.get("user_prompt"),
@@ -139,6 +154,7 @@ class BatchPipeline:
             "answer": item.get("answer"),
             "score": item.get("score"),
             "error": item.get("error"),
+            "error_type": item.get("error_type"),
             "stage": item.get("stage"),
             "system_prompt": item.get("system_prompt"),
             "user_prompt": item.get("user_prompt"),
@@ -160,10 +176,13 @@ class BatchPipeline:
                 logger.warning("Task %s score parse incomplete: %s", item.get("task_id"), score.get("raw"))
             item["score"] = score
         except Exception as exc:
-            if _is_timeout_error(exc):
+            is_timeout = _is_timeout_error(exc)
+            if is_timeout:
                 logger.warning("Score timeout for task_id: %s", item.get("task_id"))
-            logger.error("Task %s score failed: %s", item.get("task_id"), exc)
-            item["score"] = {"raw": str(exc)}
+                item["score"] = {"error_type": "timeout", "raw": str(exc)}
+            else:
+                logger.error("Task %s score failed: %s", item.get("task_id"), exc)
+                item["score"] = {"error_type": "error", "raw": str(exc)}
         return item
 
     def _build_prompts(
@@ -207,13 +226,18 @@ class BatchPipeline:
         response = self.client.solve_with_retry(
             payload, dry_run=self.dry_run, max_retries=self.max_retries,
         )
-        return {
+        result = {
             "task_id": task_id,
             "response": response,
             "answer": _extract_answer(response),
             "system_prompt": prompts["system_prompt"],
             "user_prompt": prompts["user_prompt"],
         }
+        if _is_gen_timeout(result):
+            result["error"] = "timeout"
+            result["error_type"] = "timeout"
+            result["stage"] = "generate"
+        return result
 
     def _build_tasks(
         self,
@@ -300,6 +324,7 @@ class BatchPipeline:
                             "response": None,
                             "answer": "",
                             "error": str(exc),
+                            "error_type": "timeout" if _is_timeout_error(exc) else "error",
                             "stage": "generate",
                         }
                         results.append(result)
@@ -391,6 +416,7 @@ class BatchPipeline:
                                     "response": None,
                                     "answer": "",
                                     "error": str(exc),
+                                    "error_type": "timeout" if _is_timeout_error(exc) else "error",
                                     "stage": "generate",
                                     "score": None,
                                 }
@@ -401,7 +427,7 @@ class BatchPipeline:
                             if total_batches > 1:
                                 bars[1].update(1)
 
-                            if result.get("answer") and not result.get("error"):
+                            if result.get("answer") and not result.get("error") and not _is_gen_timeout(result):
                                 entry = task_map.get(tid, {})
                                 sf = score_pool.submit(self._score_item, result, entry)
                                 score_futures[sf] = tid
@@ -527,6 +553,7 @@ class BatchPipeline:
                                     "response": None,
                                     "answer": "",
                                     "error": str(exc),
+                                    "error_type": "timeout" if _is_timeout_error(exc) else "error",
                                     "stage": "generate",
                                     "score": None,
                                 }
@@ -536,7 +563,7 @@ class BatchPipeline:
                             if gen_overall_bar:
                                 gen_overall_bar.update(1)
 
-                            if result.get("answer") and not result.get("error"):
+                            if result.get("answer") and not result.get("error") and not _is_gen_timeout(result):
                                 entry = task_map.get(tid, {})
                                 sf = score_pool.submit(self._score_item, result, entry)
                                 score_futures[sf] = tid
@@ -560,7 +587,7 @@ class BatchPipeline:
                                 logger.error("Task %s score failed: %s", tid, exc)
                                 scored_result = {
                                     "task_id": tid,
-                                    "score": {"raw": str(exc)},
+                                    "score": {"error_type": "timeout" if _is_timeout_error(exc) else "error", "raw": str(exc)},
                                 }
                             results.append(scored_result)
                             self._append_jsonl(self.scored_output, self._format_scored(scored_result))
@@ -568,7 +595,7 @@ class BatchPipeline:
                             if score_overall_bar:
                                 score_overall_bar.update(1)
 
-                            if str(tid) not in skip_train_ids:
+                            if str(tid) not in skip_train_ids and not _is_score_timeout(scored_result):
                                 record = self._train_one_item(
                                     scored_result,
                                     checkpoint_dir=checkpoint_dir,
@@ -667,14 +694,14 @@ class BatchPipeline:
                             logger.error("Task %s score failed: %s", task_id, exc)
                             scored_result = {
                                 "task_id": task_id,
-                                "score": {"raw": str(exc)},
+                                "score": {"error_type": "timeout" if _is_timeout_error(exc) else "error", "raw": str(exc)},
                             }
                         scored_results.append(scored_result)
                         if self.scored_output:
                             self._append_jsonl(self.scored_output, self._format_scored(scored_result))
                         score_bar.update(1)
 
-                        if train and str(task_id) not in skip_train_ids:
+                        if train and str(task_id) not in skip_train_ids and not _is_score_timeout(scored_result):
                             record = self._train_one_item(
                                 scored_result,
                                 checkpoint_dir=checkpoint_dir,
@@ -716,6 +743,8 @@ class BatchPipeline:
         checkpoint_every: int = 0,
     ) -> Optional[Dict[str, Any]]:
         task_id = item.get("task_id")
+        if _is_score_timeout(item):
+            return None
         if item.get("error") or not item.get("answer"):
             return None
         if self.memory_service is None:
@@ -808,6 +837,10 @@ class BatchPipeline:
                     if total_batches > 1:
                         bars[1].update(1)
                     continue
+                if _is_score_timeout(item):
+                    if total_batches > 1:
+                        bars[1].update(1)
+                    continue
                 response = item.get("response", {})
                 status = response.get("status") if isinstance(response, dict) else None
                 trajectory = json.dumps(
@@ -888,23 +921,23 @@ class BatchPipeline:
         score_error = 0
 
         for r in results:
-            error = r.get("error")
-            stage = r.get("stage")
+            error_type = r.get("error_type")
             score_info = r.get("score")
-            raw = score_info.get("raw", "") if isinstance(score_info, dict) else ""
+            score_error_type = score_info.get("error_type") if isinstance(score_info, dict) else None
 
-            if error:
-                err_lower = str(error).lower()
-                if "timeout" in err_lower or "timed out" in err_lower:
-                    gen_timeout += 1
-                else:
-                    gen_error += 1
+            resp = r.get("response")
+            resp_status = resp.get("status") if isinstance(resp, dict) else None
+
+            if error_type == "timeout" or resp_status == "timeout":
+                gen_timeout += 1
+            elif error_type == "error":
+                gen_error += 1
+            elif score_error_type == "timeout":
+                score_timeout += 1
+            elif score_error_type == "error":
+                score_error += 1
             elif isinstance(score_info, dict) and not score_info.get("max_score"):
-                raw_lower = str(raw).lower()
-                if "timeout" in raw_lower or "timed out" in raw_lower:
-                    score_timeout += 1
-                elif raw:
-                    score_error += 1
+                score_error += 1
 
         scored = [
             r
