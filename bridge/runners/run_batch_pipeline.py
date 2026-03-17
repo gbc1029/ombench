@@ -14,7 +14,7 @@ from bridge.runners.batch_pipeline import BatchPipeline
 from experiment.client.solver import SolveClient
 from experiment.config.settings import SolveSettings, resolve_model_alias
 from experiment.prompt.onemillion_prompt import load_memory_context
-from memrl.providers.embedding import LocalEmbedder
+from memrl.providers.embedding import OpenAIEmbedder
 from memrl.providers.llm import OpenAILLM
 from ombench_eval.judge import JudgeSettings, OpenAIJudge
 
@@ -240,9 +240,12 @@ def _build_memory_service(args, llm, embedder, temp_dir, *, train_api_base: str)
                     },
                 },
                 "embedder": {
-                    "backend": "sentence_transformer",
+                    "backend": "universal_api",
                     "config": {
-                        "model_name_or_path": "all-MiniLM-L6-v2",
+                        "model_name_or_path": "qwen3-embedding-8b",
+                        "provider": "openai",
+                        "api_key": api_key,
+                        "base_url": "https://og5o9mjcdgckcmejjobdgmjh9ddcjcmk.openapi-qb.sii.edu.cn/v1",
                     },
                 },
                 "chunker": {"backend": "sentence", "config": {"chunk_size": 500}},
@@ -485,7 +488,11 @@ def main() -> None:
                 default_temperature=0.1,
                 default_max_tokens=4096,
             )
-            embedder = LocalEmbedder(model_name="all-MiniLM-L6-v2")
+            embedder = OpenAIEmbedder(
+                api_key=train_api_key,
+                base_url="https://og5o9mjcdgckcmejjobdgmjh9ddcjcmk.openapi-qb.sii.edu.cn/v1",
+                model="qwen3-embedding-8b",
+            )
             try:
                 memory_service = _build_memory_service(
                     args, train_llm, embedder, temp_dir, train_api_base=train_api_base,

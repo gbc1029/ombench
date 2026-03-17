@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from memrl.providers.embedding import LocalEmbedder
+from memrl.providers.embedding import OpenAIEmbedder
 from bridge.adapters.solve_llm import SolveLLM
 from bridge.dataset.onemillion_loader import load_entries
 from experiment.client.solver import SolveClient
@@ -67,9 +67,12 @@ def _write_mos_config(temp_dir: Path, *, api_key: str, base_url: str, model: str
                     },
                 },
                 "embedder": {
-                    "backend": "sentence_transformer",
+                    "backend": "universal_api",
                     "config": {
-                        "model_name_or_path": "all-MiniLM-L6-v2",
+                        "model_name_or_path": "qwen3-embedding-8b",
+                        "provider": "openai",
+                        "api_key": api_key,
+                        "base_url": "https://og5o9mjcdgckcmejjobdgmjh9ddcjcmk.openapi-qb.sii.edu.cn/v1",
                     },
                 },
                 "chunker": {"backend": "sentence", "config": {"chunk_size": 500}},
@@ -158,7 +161,11 @@ def main() -> None:
         default_temperature=0.1,
         default_max_tokens=4096,
     )
-    embedder = LocalEmbedder(model_name="all-MiniLM-L6-v2")
+    embedder = OpenAIEmbedder(
+        api_key=train_api_key,
+        base_url="https://og5o9mjcdgckcmejjobdgmjh9ddcjcmk.openapi-qb.sii.edu.cn/v1",
+        model="qwen3-embedding-8b",
+    )
 
     with tempfile.TemporaryDirectory(prefix="onemillion_memrl_") as temp_dir:
         mos_config = _write_mos_config(
