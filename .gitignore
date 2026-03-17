@@ -31,3 +31,5 @@ Thumbs.db
 # Egg info
 *.egg-info/
 holos_synergy_repo.egg-info/
+
+local_cche/
