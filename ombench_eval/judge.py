@@ -287,6 +287,7 @@ class JudgeSettings:
     api_key_env: str = "INF_API_KEY"
     timeout: int = 600
     max_tokens: int = 16384
+    max_retries: int = 2
 
 
 class OpenAIJudge(BaseJudge):
@@ -332,13 +333,14 @@ class OpenAIJudge(BaseJudge):
     def judge(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         last_error: Optional[Exception] = None
         last_answer_text: str = ""
-        for attempt in range(MAX_RETRIES):
+        max_retries = self.settings.max_retries
+        for attempt in range(max_retries):
             try:
                 response = self._call_api(system_prompt, user_prompt)
                 answer_text = _extract_answer_text(response)
                 if not answer_text:
                     last_error = ValueError("Empty answer from judge")
-                    logger.warning("Judge returned empty answer (attempt %d/%d)", attempt + 1, MAX_RETRIES)
+                    logger.warning("Judge returned empty answer (attempt %d/%d)", attempt + 1, max_retries)
                     continue
 
                 last_answer_text = answer_text
@@ -357,11 +359,11 @@ class OpenAIJudge(BaseJudge):
                     return {"rubric_array": [], "raw": answer_text, "raw_response": answer_text}
 
                 last_error = ValueError(f"Could not parse judge response as JSON array: {answer_text[:200]}")
-                logger.warning("JSON parse failed (attempt %d/%d): %s", attempt + 1, MAX_RETRIES, answer_text[:200])
+                logger.warning("JSON parse failed (attempt %d/%d): %s", attempt + 1, max_retries, answer_text[:200])
 
             except Exception as exc:
                 last_error = exc
-                logger.warning("Judge API call failed (attempt %d/%d): %s", attempt + 1, MAX_RETRIES, exc)
+                logger.warning("Judge API call failed (attempt %d/%d): %s", attempt + 1, max_retries, exc)
 
         return {
             "rubric_array": [],

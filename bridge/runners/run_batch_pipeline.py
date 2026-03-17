@@ -121,6 +121,12 @@ def parse_args() -> argparse.Namespace:
         default=600,
         help="Timeout for scoring/judge requests (default: 600)",
     )
+    parser.add_argument(
+        "--judge-retries",
+        type=int,
+        default=2,
+        help="Max attempts for each judge scoring call (default: 2)",
+    )
     parser.add_argument("--step-limit", type=int, default=150)
     parser.add_argument(
         "--workers",
@@ -448,6 +454,7 @@ def main() -> None:
             base_url=args.judge_base_url,
             model=args.judge_model,
             timeout=args.judge_timeout,
+            max_retries=args.judge_retries,
         ),
         dry_run=args.dry_run,
     )

@@ -22,7 +22,7 @@ holos-synergy-repo/
 │   ├── dataset/               # 数据集加载
 │   └── runners/               # 批量管线 & 联动训练入口
 ├── ombench_eval/              # OMBench 评测模块
-│   ├── evaluator.py           # 评分核心逻辑（单条 & 批量）
+│   ├── evaluator.py           # 评分核心逻辑
 │   ├── judge.py               # Judge 实现（OpenAI 兼容 API）
 │   ├── prompts.py             # 评分提示词模板
 │   ├── run_eval.py            # 评测 CLI 入口
@@ -196,9 +196,13 @@ python -m ombench_eval.run_eval \
 
 ### 三阶段流程
 
-1. **Generate**：从 dataset 批量构建 prompt 并发送到 `/task/solve`，`ThreadPoolExecutor` 并发。每生成一条结果**立即写入** `outputs/generated.jsonl`
-2. **Score**：每条生成结果完成后立即提交评分（`/v1/chat/completions`），按 `score_workers` 并发。每获得一条评分结果**立即写入** `outputs/scored.jsonl`
-3. **Train**：将响应和分数写入 MemRL 记忆（串行，`MemoryService` 自管并发）。每训练一条**立即写入** `outputs/trained.jsonl`
+当 `--pipeline gen,score,train` 时，管线使用**流式交织模式**（`generate_score_train_tasks`）：
+
+1. **Generate**：从 dataset 批量构建 prompt 并发送到 `/task/solve`，按 `--workers` 并发。每生成一条结果**立即写入** `outputs/generated.jsonl`
+2. **Score**：每条生成结果完成后**立即提交评分**（`/v1/chat/completions`），按 `--score-workers` 并发。每获得一条评分结果**立即写入** `outputs/scored.jsonl`
+3. **Train**：每条评分完成后**立即训练**（写入 MemRL 记忆）。每训练一条**立即写入** `outputs/trained.jsonl`
+
+三个阶段的进度条同步显示，不需要等前一阶段全部完成。
 
 ### 实时写入行为
 
@@ -271,7 +275,7 @@ python -m bridge.runners.run_batch_pipeline \
 
 ### 分批训练
 
-使用 `--gen-score-batch` 控制每批的 task 数量，每批完成后立即训练。通过 `--batch-train false` 可关闭分批模式。
+使用 `--gen-score-batch` 控制每批的 task 数量。设为 `0` 可关闭分批，所有任务在单次调用中完成。
 
 - **memrl 模式**：每轮均使用记忆增强生成
 - **plain 模式**：第一轮使用纯生成（无记忆），后续轮次自动切换为 memrl 模式（使用前轮训练积累的记忆）
@@ -287,19 +291,30 @@ python -m bridge.runners.run_batch_pipeline \
   --mode memrl --pipeline gen,score,train \
   --gen-score-batch 50 --workers 4
 
-# 关闭分批：全量生成+评分后再统一训练
+# 关闭分批：全量在单次调用中完成
 python -m bridge.runners.run_batch_pipeline \
   --mode plain --pipeline gen,score,train \
-  --batch-train false --workers 4
+  --gen-score-batch 0 --workers 4
 ```
 
 ### run_batch_pipeline 完整参数
+
+参数按功能分组排列。
+
+#### 基本配置
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--mode` | `plain` | 生成模式：`plain` / `memrl` |
 | `--pipeline` | `gen,score,train` | 执行阶段（逗号分隔）：`gen` / `score` / `train` |
 | `--dataset-dir` | `datasets/OneMillion-Bench` | 数据集目录 |
+| `--limit` | `0` | 随机抽样任务数量（0 = 全部） |
+| `--dry-run` | `false` | 不发送实际请求 |
+
+#### 生成阶段
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
 | `--base-url` | `http://10.245.198.39:8000` | 生成模型服务地址 |
 | `--endpoint` | `/task/solve` | 生成请求端点 |
 | `--model` | `qwen` | 生成模型（别名：`qwen`/`nex`） |
@@ -307,42 +322,63 @@ python -m bridge.runners.run_batch_pipeline \
 | `--step-limit` | `150` | 生成步数限制 |
 | `--workers` | `4` | 生成阶段并发数 |
 | `--max-retries` | `1` | 单条生成请求最大重试次数（指数退避） |
+| `--memory-context` | 无 | memrl 模式的记忆上下文文件（JSON/JSONL） |
+
+#### 评分阶段
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
 | `--judge-model` | `qwen3.5-397b-a17b` | 评分模型 |
 | `--judge-base-url` | `https://holos.openapi-qb.sii.edu.cn` | 评分 API 地址 |
 | `--judge-timeout` | `600` | 评分请求超时（秒） |
+| `--judge-retries` | `2` | 单条评分请求最大尝试次数（含首次，默认 2 即重试 1 次） |
 | `--score-workers` | `4` | 评分阶段并发数 |
-| `--limit` | `0` | 随机抽样任务数量（0 = 全部） |
-| `--dry-run` | `false` | 不发送实际请求 |
-| `--generated-output` | `outputs/generated.jsonl` | 生成结果输出 JSONL |
-| `--scored-output` | `outputs/scored.jsonl` | 评分结果输出 JSONL |
-| `--trained-output` | `outputs/trained.jsonl` | 训练记录输出 JSONL |
-| `--resume-gen-score` | 无 | 跳过已有的 gen/score task_id（JSONL 路径） |
-| `--resume-train` | 无（自动） | 训练续跑控制：omit=自动 / `true`=跳过已训练 / `false`=从头训练 |
-| `--memory-context` | 无 | memrl 模式的记忆上下文文件（JSON/JSONL） |
+
+#### 训练阶段
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
 | `--train-base-url` | `https://holos.openapi-qb.sii.edu.cn` | 训练 LLM API 地址 |
 | `--train-endpoint` | `/v1/chat/completions` | 训练 LLM 端点 |
 | `--train-model` | `qwen3.5-397b-a17b` | 训练 LLM 模型 |
 | `--train-api-key-env` | `INF_API_KEY` | 训练 API Key 环境变量名 |
 | `--checkpoint-dir` | `checkpoints/batch_pipeline` | 记忆 checkpoint 保存目录 |
 | `--checkpoint-every` | `100` | 每训练 N 条保存一次 checkpoint |
-| `--gen-score-batch` | `100` | 分批大小（gen+score+train 循环） |
-| `--batch-train` | `true` | 是否启用分批 gen→score→train 循环（仅 pipeline=gen,score,train 生效） |
 | `--load-checkpoint` | 无 | 启动时加载指定 checkpoint 目录（仅 memrl 模式） |
+
+#### 输出与续跑
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--generated-output` | `outputs/generated.jsonl` | 生成结果输出 JSONL |
+| `--scored-output` | `outputs/scored.jsonl` | 评分结果输出 JSONL |
+| `--trained-output` | `outputs/trained.jsonl` | 训练记录输出 JSONL |
+| `--resume-gen-score` | 无 | 跳过已有的 gen/score task_id（JSONL 路径） |
+| `--resume-train` | 无（自动） | 训练续跑控制：omit=自动 / `true`=跳过已训练 / `false`=从头训练 |
+
+#### 分批控制
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--gen-score-batch` | `100` | 分批大小（仅 pipeline=gen,score,train 时生效）；设为 `0` 关闭分批 |
 
 ### 汇总统计
 
 运行结束后自动输出统计：
 
 ```
-========================================
-  Total: 100 | Completed: 95 | Failed: 5
+==================================================
+  Total: 100 | Scored: 85 | Failed: 15
   Avg Score: 7.2/10.0 (72.0%)
-  By subset:
-    natural_science: 38/40 completed, avg 7.5/10.0
-    law:             25/28 completed, avg 6.8/10.0
-    ...
-========================================
+  Errors: gen_timeout=3, score_timeout=5, gen_error=2, score_error=5
+==================================================
 ```
+
+- **Total**：总任务数
+- **Scored**：成功获得评分的任务数（`max_score > 0`）
+- **Avg Score**：成功评分部分的平均得分
+- **gen_timeout / score_timeout**：生成 / 评分阶段超时数
+- **gen_error / score_error**：生成 / 评分阶段其他错误数
 
 ---
 
@@ -391,6 +427,7 @@ python -m bridge.runners.run_onemillion_memrl \
 | `api_key_env` | `INF_API_KEY` | 读取 API Key 的环境变量名 |
 | `timeout` | `600` | 请求超时（秒） |
 | `max_tokens` | `16384` | 最大生成 token 数（避免截断） |
+| `max_retries` | `2` | 最大尝试次数（含首次，即重试 1 次） |
 
 ---
 
@@ -405,9 +442,9 @@ python -m bridge.runners.run_onemillion_memrl \
 | `bridge/runners/batch_pipeline.py` | 批量管线核心（`BatchPipeline` 类，实时写入 + 进度展示） |
 | `bridge/runners/run_batch_pipeline.py` | 批量管线 CLI 入口 |
 | `bridge/runners/run_onemillion_memrl.py` | 串行联动训练入口 |
-| `ombench_eval/evaluator.py` | 评分核心（`score_response` + `score_responses_batch`） |
+| `ombench_eval/evaluator.py` | 评分核心（`score_response` 单条评分 + `score_responses_batch` 并发封装） |
 | `ombench_eval/judge.py` | Judge 实现（`OpenAIJudge`） |
-| `ombench_eval/prompts.py` | 评分提示词（单条 + 批量模板） |
+| `ombench_eval/prompts.py` | 评分提示词模板 |
 | `ombench_eval/run_eval.py` | 评测 CLI 入口 |
 
 ## 注意事项
