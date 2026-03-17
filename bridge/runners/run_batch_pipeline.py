@@ -314,6 +314,18 @@ def _clear_file(path: Path) -> None:
     path.open("w", encoding="utf-8").close()
 
 
+def _migrate_file(path: Path, batch_idx: int) -> None:
+    """Rename an existing output file to *_batch{N}.ext, then clear the original."""
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    suffix = path.suffix
+    stem = path.stem
+    dest = path.with_name(f"{stem}_batch{batch_idx}{suffix}")
+    path.rename(dest)
+    _log.info("Migrated %s -> %s", path, dest)
+    _clear_file(path)
+
+
 def _filter_results(results: list[dict[str, object]], skip_ids: set[str]) -> list[dict[str, object]]:
     if not skip_ids:
         return results
@@ -540,11 +552,11 @@ def main() -> None:
             tasks = pipeline._build_tasks(entries, resume_gen_score)
             if len(tasks) > args.gen_score_batch:
                 all_results: list[dict[str, object]] = []
+                all_trained: list[dict[str, object]] = []
                 batches = _iter_batches(tasks, args.gen_score_batch)
                 total_batches = len(batches)
                 global_total = len(tasks)
-                global_gen_offset = 0
-                global_train_offset = 0
+                global_offset = 0
 
                 # First batch: honour resume flags, clear files that need clearing
                 if should_clear_trained:
@@ -571,38 +583,32 @@ def main() -> None:
                             batch_idx, total_batches,
                         )
 
-                    # After the first batch: clear output files and reset skip ids
-                    # so each batch writes fresh; resume flags only apply to batch 1
+                    # After the first batch: migrate output files to *_batch{N}.ext
+                    # then clear originals; resume flags only apply to batch 1
                     if idx > 0:
-                        _clear_file(args.generated_output)
-                        _clear_file(args.scored_output)
-                        _clear_file(args.trained_output)
+                        _migrate_file(args.generated_output, idx)
+                        _migrate_file(args.scored_output, idx)
+                        _migrate_file(args.trained_output, idx)
                         skip_train_ids = set()
 
-                    batch_results = pipeline.generate_and_score_tasks(
-                        batch,
-                        mode=gen_mode,
-                        batch_idx=batch_idx,
-                        total_batches=total_batches,
-                        global_offset=global_gen_offset,
-                        global_total=global_total,
+                    batch_results, trained_records, last_checkpoint = (
+                        pipeline.generate_score_train_tasks(
+                            batch,
+                            mode=gen_mode,
+                            skip_train_ids=skip_train_ids,
+                            checkpoint_dir=args.checkpoint_dir,
+                            checkpoint_every=args.checkpoint_every,
+                            save_final=True,
+                            batch_idx=batch_idx,
+                            total_batches=total_batches,
+                            global_offset=global_offset,
+                            global_total=global_total,
+                        )
                     )
                     all_results.extend(batch_results)
-                    global_gen_offset += len(batch)
+                    all_trained.extend(trained_records)
+                    global_offset += len(batch)
 
-                    filtered = _filter_results(batch_results, skip_train_ids)
-                    _, trained_records, last_checkpoint = pipeline.train(
-                        filtered,
-                        skip_ids=skip_train_ids,
-                        checkpoint_dir=args.checkpoint_dir,
-                        checkpoint_every=args.checkpoint_every,
-                        save_final=True,
-                        batch_idx=batch_idx,
-                        total_batches=total_batches,
-                        global_offset=global_train_offset,
-                        global_total=global_total,
-                    )
-                    global_train_offset += len(filtered)
                     if trained_records:
                         skip_train_ids.update(
                             {str(item.get("task_id")) for item in trained_records if item.get("task_id")}

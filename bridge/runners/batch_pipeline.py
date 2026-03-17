@@ -97,6 +97,9 @@ class BatchPipeline:
         self.trained_output = trained_output
         self._write_lock = threading.Lock()
         self._initialized_files: set[Path] = set()
+        self._train_count = 0
+        self._train_last_saved = 0
+        self._last_checkpoint: Optional[Dict[str, Any]] = None
 
     def init_output_files(self, *, append: bool = False) -> None:
         if append:
@@ -432,6 +435,163 @@ class BatchPipeline:
 
         return results
 
+    def generate_score_train_tasks(
+        self,
+        tasks: List[tuple[str, Dict[str, Any]]],
+        *,
+        mode: str = "plain",
+        skip_train_ids: Optional[set] = None,
+        checkpoint_dir: Optional[Path] = None,
+        checkpoint_every: int = 0,
+        save_final: bool = True,
+        batch_idx: int = 1,
+        total_batches: int = 1,
+        global_offset: int = 0,
+        global_total: int = 0,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        results: List[Dict[str, Any]] = []
+        trained_records: List[Dict[str, Any]] = []
+        task_map = {task_id: entry for task_id, entry in tasks}
+        effective_global_total = global_total or len(tasks)
+        skip_train_ids = skip_train_ids or set()
+
+        self._train_count = 0
+        self._train_last_saved = 0
+        self._last_checkpoint = None
+
+        logger.info(
+            "Pipeline: %d tasks, gen_workers=%d, score_workers=%d, mode=%s",
+            len(tasks), self.workers, self.score_workers, mode,
+        )
+
+        gen_desc = _batch_desc("Generate", batch_idx, total_batches)
+        score_desc = _batch_desc("Score", batch_idx, total_batches)
+        train_desc = _batch_desc("Train", batch_idx, total_batches)
+
+        with (
+            ThreadPoolExecutor(max_workers=self.workers) as gen_pool,
+            ThreadPoolExecutor(max_workers=self.score_workers) as score_pool,
+        ):
+            gen_futures = {
+                gen_pool.submit(self._generate_one_direct, tid, ent, mode=mode): tid
+                for tid, ent in tasks
+            }
+            score_futures: Dict[Any, str] = {}
+
+            pos = 0
+            bars: List[Any] = []
+
+            gen_bar = tqdm(total=len(tasks), desc=gen_desc, unit="task", position=pos)
+            bars.append(gen_bar)
+            pos += 1
+            gen_overall_bar = None
+            if total_batches > 1:
+                gen_overall_bar = tqdm(total=effective_global_total, desc="Overall Generate", unit="task", initial=global_offset, position=pos)
+                bars.append(gen_overall_bar)
+                pos += 1
+
+            score_bar = tqdm(total=len(tasks), desc=score_desc, unit="task", position=pos)
+            bars.append(score_bar)
+            pos += 1
+            score_overall_bar = None
+            if total_batches > 1:
+                score_overall_bar = tqdm(total=effective_global_total, desc="Overall Score", unit="task", initial=global_offset, position=pos)
+                bars.append(score_overall_bar)
+                pos += 1
+
+            train_bar = tqdm(total=len(tasks), desc=train_desc, unit="task", position=pos)
+            bars.append(train_bar)
+            pos += 1
+            train_overall_bar = None
+            if total_batches > 1:
+                train_overall_bar = tqdm(total=effective_global_total, desc="Overall Train", unit="task", initial=global_offset, position=pos)
+                bars.append(train_overall_bar)
+
+            try:
+                pending: set = set(gen_futures.keys())
+
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+
+                    for future in done:
+                        if future in gen_futures:
+                            tid = gen_futures[future]
+                            try:
+                                result = future.result()
+                            except Exception as exc:
+                                logger.error("Task %s generation failed: %s", tid, exc)
+                                result = {
+                                    "task_id": tid,
+                                    "response": None,
+                                    "answer": "",
+                                    "error": str(exc),
+                                    "stage": "generate",
+                                    "score": None,
+                                }
+
+                            self._append_jsonl(self.generated_output, self._format_generated(result))
+                            gen_bar.update(1)
+                            if gen_overall_bar:
+                                gen_overall_bar.update(1)
+
+                            if result.get("answer") and not result.get("error"):
+                                entry = task_map.get(tid, {})
+                                sf = score_pool.submit(self._score_item, result, entry)
+                                score_futures[sf] = tid
+                                pending.add(sf)
+                            else:
+                                result["score"] = None
+                                results.append(result)
+                                self._append_jsonl(self.scored_output, self._format_scored(result))
+                                score_bar.update(1)
+                                if score_overall_bar:
+                                    score_overall_bar.update(1)
+                                train_bar.update(1)
+                                if train_overall_bar:
+                                    train_overall_bar.update(1)
+
+                        elif future in score_futures:
+                            tid = score_futures[future]
+                            try:
+                                scored_result = future.result()
+                            except Exception as exc:
+                                logger.error("Task %s score failed: %s", tid, exc)
+                                scored_result = {
+                                    "task_id": tid,
+                                    "score": {"raw": str(exc)},
+                                }
+                            results.append(scored_result)
+                            self._append_jsonl(self.scored_output, self._format_scored(scored_result))
+                            score_bar.update(1)
+                            if score_overall_bar:
+                                score_overall_bar.update(1)
+
+                            if str(tid) not in skip_train_ids:
+                                record = self._train_one_item(
+                                    scored_result,
+                                    checkpoint_dir=checkpoint_dir,
+                                    checkpoint_every=checkpoint_every,
+                                )
+                                if record:
+                                    trained_records.append(record)
+
+                            train_bar.update(1)
+                            if train_overall_bar:
+                                train_overall_bar.update(1)
+
+            finally:
+                for bar in bars:
+                    bar.close()
+
+        if checkpoint_dir and save_final and self._train_count > self._train_last_saved:
+            self._last_checkpoint = self._save_checkpoint(checkpoint_dir)
+
+        logger.info(
+            "Pipeline complete: %d generated, %d scored, %d trained",
+            len(tasks), len(results), len(trained_records),
+        )
+        return results, trained_records, self._last_checkpoint
+
     def score(
         self,
         results: List[Dict[str, Any]],
@@ -490,6 +650,62 @@ class BatchPipeline:
             return self.memory_service.save_checkpoint_snapshot(str(checkpoint_dir), ckpt_id)
         except Exception as exc:
             logger.warning("Failed to save checkpoint %s: %s", ckpt_id, exc)
+            return None
+
+    def _train_one_item(
+        self,
+        item: Dict[str, Any],
+        *,
+        checkpoint_dir: Optional[Path] = None,
+        checkpoint_every: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        task_id = item.get("task_id")
+        if item.get("error") or not item.get("answer"):
+            return None
+        if self.memory_service is None:
+            return None
+        response = item.get("response", {})
+        status = response.get("status") if isinstance(response, dict) else None
+        trajectory = json.dumps(
+            response.get("session_data", {}).get("messages", [])
+            if isinstance(response, dict)
+            else [],
+            ensure_ascii=False,
+        )
+        score_info = item.get("score", {})
+        is_success = status == "completed"
+        if isinstance(score_info, dict) and score_info.get("max_score"):
+            ratio = score_info.get("score", 0) / score_info["max_score"]
+            is_success = is_success or ratio >= 0.5
+
+        try:
+            self.memory_service.add_memory(
+                task_description=item.get("user_prompt", ""),
+                trajectory=trajectory,
+                success=is_success,
+                metadata={
+                    "task_id": task_id,
+                    "request_id": response.get("request_id")
+                    if isinstance(response, dict)
+                    else None,
+                    "task_status": status,
+                    "score": score_info,
+                },
+            )
+            record = {
+                "task_id": task_id,
+                "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            self._append_jsonl(self.trained_output, record)
+
+            self._train_count += 1
+            if checkpoint_dir and checkpoint_every > 0:
+                if self._train_count - self._train_last_saved >= checkpoint_every:
+                    self._last_checkpoint = self._save_checkpoint(checkpoint_dir)
+                    self._train_last_saved = self._train_count
+            return record
+        except Exception as exc:
+            logger.error("Task %s train failed: %s", task_id, exc)
             return None
 
     def train(

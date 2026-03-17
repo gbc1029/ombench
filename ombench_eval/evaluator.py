@@ -41,12 +41,19 @@ def score_response(
     if not isinstance(result, dict):
         return {"rubric_results": [], "score": 0, "max_score": 0, "raw": result}
 
+    raw_response = result.get("raw_response", "")
+    raw_error = result.get("raw")
+
     rubric_array = result.get("rubric_array")
     if isinstance(rubric_array, list):
         raw_results = parse_rubric_array(rubric_array, rubrics)
-        return convert_scores(raw_results, rubrics)
+        scores = convert_scores(raw_results, rubrics)
+        scores["raw_response"] = raw_response
+        if raw_error is not None:
+            scores["raw"] = raw_error
+        return scores
 
-    return {"rubric_results": [], "score": 0, "max_score": 0, "raw": result}
+    return {"rubric_results": [], "score": 0, "max_score": 0, "raw": result, "raw_response": raw_response}
 
 
 def _score_batch_group(
