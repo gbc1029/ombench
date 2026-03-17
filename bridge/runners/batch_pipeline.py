@@ -15,7 +15,7 @@ from tqdm import tqdm
 from experiment.client.solver import SolveClient
 from experiment.config.settings import SolveSettings
 from experiment.prompt.onemillion_prompt import apply_memory, build_plain_prompts
-from ombench_eval.evaluator import score_response, score_responses_batch
+from ombench_eval.evaluator import score_response
 from ombench_eval.judge import BaseJudge
 
 logger = logging.getLogger(__name__)
@@ -623,19 +623,35 @@ class BatchPipeline:
         if not score_items:
             return results
 
-        batch_scores = score_responses_batch(
-            judge=self.judge,
-            items=score_items,
-            batch_size=1,
-            max_workers=self.score_workers,
-            show_progress=True,
-        )
+        scores: List[Optional[Dict[str, Any]]] = [None] * len(score_items)
+        with ThreadPoolExecutor(max_workers=self.score_workers) as pool:
+            future_map = {
+                pool.submit(
+                    score_response,
+                    judge=self.judge,
+                    question=item["question"],
+                    response=item["response"],
+                    rubrics=item["rubrics"],
+                    system_prompt=item.get("system_prompt"),
+                ): pos
+                for pos, item in enumerate(score_items)
+            }
+            bar = tqdm(total=len(future_map), desc="Score", unit="task")
+            try:
+                for future in as_completed(future_map):
+                    pos = future_map[future]
+                    try:
+                        scores[pos] = future.result()
+                    except Exception as exc:
+                        logger.error("Score task %d failed: %s", pos, exc)
+                        scores[pos] = {"rubric_results": [], "score": 0, "max_score": 0, "raw": str(exc)}
+                    finally:
+                        bar.update(1)
+            finally:
+                bar.close()
 
         for pos, idx in enumerate(scoreable_indices):
-            if pos < len(batch_scores):
-                results[idx]["score"] = batch_scores[pos]
-            else:
-                results[idx]["score"] = None
+            results[idx]["score"] = scores[pos] if scores[pos] is not None else None
 
         return results
 
@@ -825,46 +841,55 @@ class BatchPipeline:
 
     def print_summary(self, results: List[Dict[str, Any]]) -> None:
         total = len(results)
-        errors = [r for r in results if r.get("error")]
+
+        gen_timeout = 0
+        score_timeout = 0
+        gen_error = 0
+        score_error = 0
+
+        for r in results:
+            error = r.get("error")
+            stage = r.get("stage")
+            score_info = r.get("score")
+            raw = score_info.get("raw", "") if isinstance(score_info, dict) else ""
+
+            if error:
+                err_lower = str(error).lower()
+                if "timeout" in err_lower or "timed out" in err_lower:
+                    gen_timeout += 1
+                else:
+                    gen_error += 1
+            elif isinstance(score_info, dict) and not score_info.get("max_score"):
+                raw_lower = str(raw).lower()
+                if "timeout" in raw_lower or "timed out" in raw_lower:
+                    score_timeout += 1
+                elif raw:
+                    score_error += 1
+
         scored = [
             r
             for r in results
             if isinstance(r.get("score"), dict) and r["score"].get("max_score")
         ]
 
-        print(f"\n{'=' * 40}")
-        print(f"  Total: {total} | Completed: {total - len(errors)} | Failed: {len(errors)}")
+        total_fail = gen_timeout + gen_error + score_timeout + score_error
+
+        print(f"\n{'=' * 50}")
+        print(f"  Total: {total} | Scored: {len(scored)} | Failed: {total_fail}")
 
         if scored:
             avg_score = sum(r["score"]["score"] for r in scored) / len(scored)
             avg_max = sum(r["score"]["max_score"] for r in scored) / len(scored)
             pct = (avg_score / avg_max * 100) if avg_max > 0 else 0
             print(f"  Avg Score: {avg_score:.1f}/{avg_max:.1f} ({pct:.1f}%)")
+        else:
+            print("  Avg Score: N/A (no successful scores)")
 
-        by_subset: Dict[str, List[Dict]] = defaultdict(list)
-        for r in results:
-            parts = r.get("task_id", "").split("/")
-            subset = parts[0] if parts else "unknown"
-            by_subset[subset].append(r)
+        if total_fail:
+            print(f"  Errors: gen_timeout={gen_timeout}, score_timeout={score_timeout}, "
+                  f"gen_error={gen_error}, score_error={score_error}")
 
-        if len(by_subset) > 1:
-            print("  By subset:")
-            for subset, items in sorted(by_subset.items()):
-                ok = sum(1 for i in items if not i.get("error"))
-                sub_scored = [
-                    i
-                    for i in items
-                    if isinstance(i.get("score"), dict) and i["score"].get("max_score")
-                ]
-                if sub_scored:
-                    s = sum(i["score"]["score"] for i in sub_scored) / len(sub_scored)
-                    m = sum(i["score"]["max_score"] for i in sub_scored) / len(sub_scored)
-                    print(
-                        f"    {subset}: {ok}/{len(items)} completed, avg {s:.1f}/{m:.1f}"
-                    )
-                else:
-                    print(f"    {subset}: {ok}/{len(items)} completed, no scores")
-        print(f"{'=' * 40}\n")
+        print(f"{'=' * 50}\n")
 
     def run(
         self,

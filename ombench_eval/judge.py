@@ -279,9 +279,6 @@ class BaseJudge:
     def judge(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def judge_batch(self, system_prompt: str, user_prompt: str, expected_count: int) -> List[Dict[str, Any]]:
-        raise NotImplementedError
-
 
 @dataclass
 class JudgeSettings:
@@ -355,6 +352,8 @@ class OpenAIJudge(BaseJudge):
                     arr = parsed_obj.get("rubric_results")
                     if isinstance(arr, list):
                         return {"rubric_array": arr, "raw_response": answer_text}
+                    if parsed_obj.get("rubric_id") is not None:
+                        return {"rubric_array": [parsed_obj], "raw_response": answer_text}
                     return {"rubric_array": [], "raw": answer_text, "raw_response": answer_text}
 
                 last_error = ValueError(f"Could not parse judge response as JSON array: {answer_text[:200]}")
@@ -369,44 +368,6 @@ class OpenAIJudge(BaseJudge):
             "raw": str(last_error) if last_error else "unknown error",
             "raw_response": last_answer_text,
         }
-
-    def judge_batch(self, system_prompt: str, user_prompt: str, expected_count: int) -> List[Dict[str, Any]]:
-        if expected_count == 1:
-            return [self.judge(system_prompt, user_prompt)]
-
-        last_error: Optional[Exception] = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = self._call_api(system_prompt, user_prompt)
-                answer_text = _extract_answer_text(response)
-
-                if not answer_text:
-                    last_error = ValueError("Empty answer from judge")
-                    logger.warning("Judge batch returned empty answer (attempt %d/%d)", attempt + 1, MAX_RETRIES)
-                    continue
-
-                parsed_array = _extract_json_array(answer_text)
-                if parsed_array is not None:
-                    if len(parsed_array) == expected_count:
-                        all_inner = all(isinstance(item, list) for item in parsed_array)
-                        if all_inner:
-                            return [{"rubric_array": inner} for inner in parsed_array]
-
-                    if len(parsed_array) > 0 and isinstance(parsed_array[0], dict):
-                        return [{"rubric_array": parsed_array}] + [
-                            {"rubric_array": [], "raw": "missing"} for _ in range(expected_count - 1)
-                        ]
-
-                last_error = ValueError(f"Batch parse failed: {answer_text[:200]}")
-                logger.warning("Batch JSON parse failed (attempt %d/%d)", attempt + 1, MAX_RETRIES)
-
-            except Exception as exc:
-                last_error = exc
-                logger.warning("Judge batch API call failed (attempt %d/%d): %s", attempt + 1, MAX_RETRIES, exc)
-
-        return [{"rubric_array": [], "raw": str(last_error) if last_error else "unknown error"}] + [
-            {"rubric_array": [], "raw": "missing"} for _ in range(expected_count - 1)
-        ]
 
 
 # Keep backward-compatible aliases

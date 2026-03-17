@@ -66,10 +66,6 @@ def _parse_resume_train(value: str | None) -> str | None:
     )
 
 
-def _parse_batch_train(value: str) -> bool:
-    return value.strip().lower() in ("true", "1", "yes")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Batch pipeline: generate / score / train",
@@ -203,16 +199,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Load memory checkpoint before memrl generation",
-    )
-    parser.add_argument(
-        "--batch-train",
-        default="true",
-        help=(
-            "Enable batched gen->score->train loop. "
-            "Only effective when pipeline=gen,score,train. "
-            "'true' (default): interleave batches; "
-            "'false': run gen+score for all tasks first, then train."
-        ),
     )
     return parser.parse_args()
 
@@ -540,16 +526,20 @@ def main() -> None:
                     )
 
         # ---------------------------------------------------------------
-        # Batched path: gen+score+train interleaved per batch
+        # Streaming path: gen+score+train interleaved
         # ---------------------------------------------------------------
-        batch_train = _parse_batch_train(args.batch_train)
-
         if {
             "gen",
             "score",
             "train",
-        }.issubset(stages) and batch_train and need_train:
+        }.issubset(stages) and need_train:
             tasks = pipeline._build_tasks(entries, resume_gen_score)
+
+            # Clear trained-output upfront when needed
+            if should_clear_trained:
+                _clear_file(args.trained_output)
+            pipeline.init_output_files(append=False)
+
             if len(tasks) > args.gen_score_batch:
                 all_results: list[dict[str, object]] = []
                 all_trained: list[dict[str, object]] = []
@@ -557,11 +547,6 @@ def main() -> None:
                 total_batches = len(batches)
                 global_total = len(tasks)
                 global_offset = 0
-
-                # First batch: honour resume flags, clear files that need clearing
-                if should_clear_trained:
-                    _clear_file(args.trained_output)
-                pipeline.init_output_files(append=False)
 
                 for idx, batch in enumerate(batches):
                     batch_idx = idx + 1
@@ -623,9 +608,20 @@ def main() -> None:
                                     "Failed to reload checkpoint (%s)", exc,
                                 )
 
-                if "score" in stages:
-                    pipeline.print_summary(all_results)
-                return
+                pipeline.print_summary(all_results)
+            else:
+                results, trained_records, last_checkpoint = (
+                    pipeline.generate_score_train_tasks(
+                        tasks,
+                        mode=args.mode,
+                        skip_train_ids=skip_train_ids,
+                        checkpoint_dir=args.checkpoint_dir,
+                        checkpoint_every=args.checkpoint_every,
+                        save_final=True,
+                    )
+                )
+                pipeline.print_summary(results)
+            return
 
         # ---------------------------------------------------------------
         # Non-batched paths
