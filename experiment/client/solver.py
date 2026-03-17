@@ -43,6 +43,7 @@ class SolveClient:
         if dry_run:
             return {"status": "dry_run", "request": payload}
 
+        task_id = payload.get("task_id", "?")
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             self.endpoint.url(),
@@ -50,9 +51,22 @@ class SolveClient:
             headers=self.headers,
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-        return json.loads(body)
+        t0 = time.monotonic()
+        send_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        logger.info("[GEN] task=%s send=%s timeout=%s", task_id, send_ts, timeout)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+            elapsed = time.monotonic() - t0
+            recv_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            logger.info("[GEN] task=%s recv=%s elapsed=%.1fs", task_id, recv_ts, elapsed)
+            return json.loads(body)
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            recv_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            logger.info("[GEN] task=%s fail=%s elapsed=%.1fs timeout=%s error=%s",
+                        task_id, recv_ts, elapsed, timeout, exc)
+            raise
 
     def solve_with_retry(
         self,

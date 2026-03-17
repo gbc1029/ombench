@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -321,14 +322,29 @@ class OpenAIJudge(BaseJudge):
 
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(self.url, data=data, headers=self.headers, method="POST")
+        t0 = time.monotonic()
+        send_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        logger.info("[SCORE] send=%s timeout=%s", send_ts, self.settings.timeout)
         try:
             with urllib.request.urlopen(req, timeout=self.settings.timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
-                return json.loads(body)
+            elapsed = time.monotonic() - t0
+            recv_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            logger.info("[SCORE] recv=%s elapsed=%.1fs", recv_ts, elapsed)
+            return json.loads(body)
         except urllib.error.HTTPError as exc:
+            elapsed = time.monotonic() - t0
+            recv_ts = time.strftime("%Y-%m-%d %H:%M:%S")
             err_body = exc.read().decode("utf-8", errors="replace")
-            logger.error("Judge API HTTP %d: %s", exc.code, err_body)
+            logger.error("[SCORE] fail=%s elapsed=%.1fs timeout=%s HTTP_%d: %s",
+                         recv_ts, elapsed, self.settings.timeout, exc.code, err_body)
             raise RuntimeError(f"Judge API HTTP {exc.code}: {err_body}") from exc
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            recv_ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            logger.error("[SCORE] fail=%s elapsed=%.1fs timeout=%s error=%s",
+                         recv_ts, elapsed, self.settings.timeout, exc)
+            raise
 
     def judge(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         last_error: Optional[Exception] = None
