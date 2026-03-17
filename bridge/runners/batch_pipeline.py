@@ -594,26 +594,29 @@ class BatchPipeline:
         )
         return results, trained_records, self._last_checkpoint
 
-    def score(
+    def score_streaming(
         self,
         results: List[Dict[str, Any]],
         entries: Dict[str, Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        scoreable_indices: List[int] = []
+        *,
+        train: bool = False,
+        skip_train_ids: Optional[set] = None,
+        checkpoint_dir: Optional[Path] = None,
+        checkpoint_every: int = 0,
+        save_final: bool = True,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         score_items: List[Dict[str, Any]] = []
-        for i, r in enumerate(results):
+        scoreable: List[Dict[str, Any]] = []
+        for r in results:
             if r.get("answer") and not r.get("error"):
                 entry = entries.get(r["task_id"], {})
                 score_items.append(
                     {
-                        "task_id": r.get("task_id"),
-                        "question": entry.get("question", ""),
-                        "response": r.get("answer", ""),
-                        "rubrics": entry.get("rubrics", []),
-                        "system_prompt": entry.get("system_prompt"),
+                        "item": r,
+                        "entry": entry,
                     }
                 )
-                scoreable_indices.append(i)
+                scoreable.append(r)
 
         logger.info(
             "Scoring responses: %d / %d tasks, workers=%d",
@@ -622,40 +625,75 @@ class BatchPipeline:
             self.score_workers,
         )
 
-        if not score_items:
-            return results
+        skip_train_ids = skip_train_ids or set()
+        trained_records: List[Dict[str, Any]] = []
+        self._train_count = 0
+        self._train_last_saved = 0
+        self._last_checkpoint = None
 
-        scores: List[Optional[Dict[str, Any]]] = [None] * len(score_items)
+        scored_results: List[Dict[str, Any]] = []
+
+        score_bar = tqdm(total=len(results), desc="Score", unit="task", position=0)
+        train_bar = None
+        if train:
+            train_bar = tqdm(total=len(results), desc="Train", unit="task", position=1)
+
         with ThreadPoolExecutor(max_workers=self.score_workers) as pool:
             future_map = {
-                pool.submit(
-                    score_response,
-                    judge=self.judge,
-                    question=item["question"],
-                    response=item["response"],
-                    rubrics=item["rubrics"],
-                    system_prompt=item.get("system_prompt"),
-                ): pos
-                for pos, item in enumerate(score_items)
+                pool.submit(self._score_item, item["item"], item["entry"]): item["item"].get("task_id")
+                for item in score_items
             }
-            bar = tqdm(total=len(future_map), desc="Score", unit="task")
+            pending = set(future_map.keys())
+
             try:
-                for future in as_completed(future_map):
-                    pos = future_map[future]
-                    try:
-                        scores[pos] = future.result()
-                    except Exception as exc:
-                        logger.error("Score task %d failed: %s", pos, exc)
-                        scores[pos] = {"rubric_results": [], "score": 0, "max_score": 0, "raw": str(exc)}
-                    finally:
-                        bar.update(1)
+                for item in results:
+                    if item.get("answer") and not item.get("error"):
+                        continue
+                    item["score"] = None
+                    scored_results.append(item)
+                    if self.scored_output:
+                        self._append_jsonl(self.scored_output, self._format_scored(item))
+                    score_bar.update(1)
+                    if train_bar:
+                        train_bar.update(1)
+
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        task_id = future_map.get(future)
+                        try:
+                            scored_result = future.result()
+                        except Exception as exc:
+                            logger.error("Task %s score failed: %s", task_id, exc)
+                            scored_result = {
+                                "task_id": task_id,
+                                "score": {"raw": str(exc)},
+                            }
+                        scored_results.append(scored_result)
+                        if self.scored_output:
+                            self._append_jsonl(self.scored_output, self._format_scored(scored_result))
+                        score_bar.update(1)
+
+                        if train and str(task_id) not in skip_train_ids:
+                            record = self._train_one_item(
+                                scored_result,
+                                checkpoint_dir=checkpoint_dir,
+                                checkpoint_every=checkpoint_every,
+                            )
+                            if record:
+                                trained_records.append(record)
+                        if train_bar:
+                            train_bar.update(1)
             finally:
-                bar.close()
+                score_bar.close()
+                if train_bar:
+                    train_bar.close()
 
-        for pos, idx in enumerate(scoreable_indices):
-            results[idx]["score"] = scores[pos] if scores[pos] is not None else None
+        if train and checkpoint_dir and save_final and self._train_count > self._train_last_saved:
+            self._last_checkpoint = self._save_checkpoint(checkpoint_dir)
 
-        return results
+        return scored_results, trained_records, self._last_checkpoint
+
 
     def _save_checkpoint(self, checkpoint_dir: Path) -> Optional[Dict[str, Any]]:
         if self.memory_service is None:

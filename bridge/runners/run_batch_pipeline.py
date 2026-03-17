@@ -673,18 +673,16 @@ def main() -> None:
                 raise SystemExit("Scoring requires dataset entries; enable gen/score stages")
             results = _load_results(args.generated_output, "Generated output")
             results = _filter_results(results, skip_gen_score_ids)
-            scored = pipeline.score(results, entries)
-            _write_jsonl(args.scored_output, scored)
+            scored, trained_records, last_checkpoint = pipeline.score_streaming(
+                results,
+                entries,
+                train=need_train,
+                skip_train_ids=skip_train_ids,
+                checkpoint_dir=args.checkpoint_dir,
+                checkpoint_every=args.checkpoint_every,
+                save_final=True,
+            )
             pipeline.print_summary(scored)
-            if need_train:
-                filtered = _filter_results(scored, skip_train_ids)
-                pipeline.train(
-                    filtered,
-                    skip_ids=skip_train_ids,
-                    checkpoint_dir=args.checkpoint_dir,
-                    checkpoint_every=args.checkpoint_every,
-                    save_final=True,
-                )
             return
 
         if "train" in stages:
