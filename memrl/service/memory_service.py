@@ -74,6 +74,38 @@ except Exception:
     # If anything goes wrong, fail open without blocking imports
     pass
 
+# Hotfix for qdrant-client >= 1.12 where QdrantClient.search() was removed.
+# memos' QdrantVecDB.search() still calls self.client.search(), which no longer
+# exists. We monkey-patch it to use query_points() instead.
+try:
+    from qdrant_client import QdrantClient as _QC
+
+    if not hasattr(_QC, "search"):
+        from memos.vec_dbs.qdrant import QdrantVecDB as _QdrantVecDB
+        from memos.vec_dbs.item import VecDBItem as _VecDBItem
+
+        def _patched_qdrant_search(self, query_vector, top_k, filter=None):
+            qdrant_filter = self._dict_to_filter(filter) if filter else None
+            response = self.client.query_points(
+                collection_name=self.config.collection_name,
+                query=query_vector,
+                limit=top_k,
+                query_filter=qdrant_filter,
+                with_vectors=True,
+                with_payload=True,
+            )
+            return [
+                _VecDBItem(id=p.id, vector=p.vector, payload=p.payload, score=p.score)
+                for p in response.points
+            ]
+
+        _QdrantVecDB.search = _patched_qdrant_search
+        logging.getLogger(__name__).debug(
+            "Patched QdrantVecDB.search → query_points (qdrant-client has no .search())"
+        )
+except Exception:
+    pass
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
@@ -207,13 +239,21 @@ def _resolve_snapshot_dirs(
     if isinstance(meta, dict):
         try:
             cube_candidate = meta.get("cube_dir")
-            if isinstance(cube_candidate, str) and cube_candidate and os.path.isdir(cube_candidate):
+            if (
+                isinstance(cube_candidate, str)
+                and cube_candidate
+                and os.path.isdir(cube_candidate)
+            ):
                 cube_dir = cube_candidate
         except Exception:
             pass
         try:
             qdrant_candidate = meta.get("qdrant_dir")
-            if isinstance(qdrant_candidate, str) and qdrant_candidate and os.path.isdir(qdrant_candidate):
+            if (
+                isinstance(qdrant_candidate, str)
+                and qdrant_candidate
+                and os.path.isdir(qdrant_candidate)
+            ):
                 qdrant_dir = qdrant_candidate
         except Exception:
             pass
@@ -308,12 +348,18 @@ class MemoryService:
         self.embedding_provider = embedding_provider
 
         # Similarity normalization constants (default from corpus stats; override via kwargs if needed)
-        self.sim_norm_mean: float = float(kwargs.get("sim_norm_mean", 0.1856827586889267))
-        self.sim_norm_std: float = float(kwargs.get("sim_norm_std", 0.09407906234264374)) or 1.0
+        self.sim_norm_mean: float = float(
+            kwargs.get("sim_norm_mean", 0.1856827586889267)
+        )
+        self.sim_norm_std: float = (
+            float(kwargs.get("sim_norm_std", 0.09407906234264374)) or 1.0
+        )
         # Optional: disable z-score normalization in hybrid scoring.
         # This is intentionally plumbed via kwargs so only selected runners (e.g., LLB)
         # change behavior without affecting other benchmarks by default.
-        self.use_z_score_normalization: bool = bool(kwargs.get("use_z_score_normalization", True))
+        self.use_z_score_normalization: bool = bool(
+            kwargs.get("use_z_score_normalization", True)
+        )
         # Optional: LLB-only Phase-B behavior to reduce repeated same-task memories.
         self.dedup_by_task_id: bool = bool(kwargs.get("dedup_by_task_id", False))
 
@@ -378,7 +424,7 @@ class MemoryService:
                 "backend": "qdrant",
                 "config": {
                     "collection_name": f"memp_{self.user_id}_{ts_str}",
-                    "vector_dimension": 3072,
+                    "vector_dimension": 4096,
                     "distance_metric": "cosine",
                     "path": qdrant_dir,
                 },
@@ -694,16 +740,29 @@ class MemoryService:
                 if not candidates:
                     return {
                         "action": None,
-                        "selected": None,
+                        "selected": [],
                         "candidates": [],
                         "simmax": 0.0,
                     }
-                best = max(candidates, key=lambda x: float(x.get("similarity", 0.0)))
+                # Sort descending by similarity
+                sorted_candidates = sorted(
+                    candidates,
+                    key=lambda x: float(x.get("similarity", 0.0)),
+                    reverse=True,
+                )
+                # Take top-k if k is specified, else just the best one for backwards compatibility
+                if k is not None and k > 1:
+                    selected = sorted_candidates[:k]
+                    action = [s.get("memory_id") for s in selected]
+                else:
+                    selected = sorted_candidates[0]
+                    action = selected.get("memory_id")
+
                 return {
-                    "action": best.get("memory_id"),
-                    "selected": best,
+                    "action": action,
+                    "selected": selected,
                     "candidates": candidates,
-                    "simmax": float(best.get("similarity", 0.0)),
+                    "simmax": float(sorted_candidates[0].get("similarity", 0.0)),
                 }
             # Use value-aware selection
             return self._value_selector.select(candidates, self.rl_config.topk)
@@ -734,6 +793,9 @@ class MemoryService:
         Raises:
             RuntimeError: If memory retrieval fails after retries
         """
+        if k is None:
+            k = 1
+
         retriever = get_retriever(
             self.strategy_config.retrieve,
             mos=self.mos,
@@ -772,7 +834,7 @@ class MemoryService:
         memory_id: Optional[str],
         reward: float,
         *,
-        next_max_q: Optional[float] = None
+        next_max_q: Optional[float] = None,
     ) -> Optional[float]:
         """
         Update Q-value for the selected memory. If memory_id is None (null action),
@@ -780,7 +842,10 @@ class MemoryService:
 
         Returns the new Q if updated, else None.
         """
-        if not getattr(self, 'enable_value_driven', False) or getattr(self, '_q_updater', None) is None:
+        if (
+            not getattr(self, "enable_value_driven", False)
+            or getattr(self, "_q_updater", None) is None
+        ):
             return None
         if memory_id is None:
             return None
@@ -789,8 +854,9 @@ class MemoryService:
         except Exception as e:
             raise RuntimeError(f"Failed to update Q-value: {e}")
 
-
-    def update_values(self, successes: list[float], retrieved_ids_list: list[list[str]]) -> dict[str, Optional[float]]:
+    def update_values(
+        self, successes: list[float], retrieved_ids_list: list[list[str]]
+    ) -> dict[str, Optional[float]]:
         """
         Concurrently update Q-values for all retrieved memory_ids.
 
@@ -1235,14 +1301,15 @@ class MemoryService:
             print(f"[add_memory] Error: {e}\n{traceback.format_exc()}")
             return None
 
-
     def _normalize_similarity(self, sim: float) -> float:
         """Z-norm similarity using precomputed mean/std."""
         if not getattr(self, "use_z_score_normalization", True):
             return float(sim)
-        std = self.sim_norm_std if self.sim_norm_std and self.sim_norm_std > 1e-9 else 1.0
+        std = (
+            self.sim_norm_std if self.sim_norm_std and self.sim_norm_std > 1e-9 else 1.0
+        )
         return (sim - self.sim_norm_mean) / std
-    
+
     def _normalize_q(self, q: float, mean: float, std: float) -> float:
         """Z-norm q using provided mean/std (per-call stats)."""
         if not getattr(self, "use_z_score_normalization", True):
@@ -1417,7 +1484,7 @@ class MemoryService:
 
                 c_local = dict(c)
                 c_local["q_estimate"] = q
-                c_local["task_id"] = (str(task_id) if task_id is not None else None)
+                c_local["task_id"] = str(task_id) if task_id is not None else None
                 q_values.append(q)
                 enriched.append(c_local)
 
@@ -1484,7 +1551,11 @@ class MemoryService:
                 for cand in pool:
                     tid = cand.get("task_id")
                     # If task_id missing, treat as unique by memory_id to avoid collapsing unrelated entries.
-                    key = str(tid) if tid else f"__missing_task_id__:{cand.get('memory_id')}"
+                    key = (
+                        str(tid)
+                        if tid
+                        else f"__missing_task_id__:{cand.get('memory_id')}"
+                    )
                     if key in seen_tasks:
                         continue
                     seen_tasks.add(key)
@@ -1617,7 +1688,7 @@ class MemoryService:
             for i, task_description in enumerate(task_descriptions):
                 if i < len(results):
                     recorded_task, mem_id = results[i]
-                    if recorded_task != task_description:
+                    if recorded_task != task_description[:4096]:
                         logger.warning(
                             f"Task description mismatch at index {i}: expected '{task_description}', got '{recorded_task}'"
                         )
@@ -1778,7 +1849,8 @@ class MemoryService:
         ):
             try:
                 sub_dirs = [
-                    item for item in os.listdir(snapshot_root)
+                    item
+                    for item in os.listdir(snapshot_root)
                     if os.path.isdir(os.path.join(snapshot_root, item))
                 ]
                 if sub_dirs:
@@ -1834,7 +1906,7 @@ class MemoryService:
                         "backend": "qdrant",
                         "config": {
                             "collection_name": f"memp_{self.user_id}_snapshot",
-                            "vector_dimension": 3072,
+                            "vector_dimension": 4096,
                             "distance_metric": "cosine",
                             "path": qdrant_dir,
                         },
@@ -1851,14 +1923,17 @@ class MemoryService:
         try:
             os.makedirs(qdrant_dir, exist_ok=True)
         except Exception:
-            logger.warning("Failed to ensure qdrant_dir exists: %r", qdrant_dir, exc_info=True)
+            logger.warning(
+                "Failed to ensure qdrant_dir exists: %r", qdrant_dir, exc_info=True
+            )
 
         def _is_sqlite_malformed(err: Exception) -> bool:
             msg = str(err).lower()
             return (
                 isinstance(err, sqlite3.DatabaseError)
                 or "database disk image is malformed" in msg
-                or "sqlite" in msg and "malformed" in msg
+                or "sqlite" in msg
+                and "malformed" in msg
             )
 
         try:
@@ -1891,7 +1966,9 @@ class MemoryService:
                     except Exception:
                         pass
                 os.makedirs(qdrant_dir, exist_ok=True)
-                cube = GeneralMemCube.init_from_dir(cube_dir, default_config=default_cfg)
+                cube = GeneralMemCube.init_from_dir(
+                    cube_dir, default_config=default_cfg
+                )
             else:
                 raise
         target_id = mem_cube_id or f"cube_{self.user_id}_snapshot"

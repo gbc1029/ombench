@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 GENERATION_SYSTEM_PROMPT = """\
 You are a domain expert capable of delivering professional-grade responses in both English and 中文.
@@ -46,13 +46,80 @@ def build_plain_prompts(entry: Dict[str, Any]) -> Tuple[str, str]:
     return system_prompt, user_prompt
 
 
-def apply_memory(user_prompt: str, memory: Optional[str]) -> str:
+def apply_memory(user_prompt: str, memory: Union[str, List[Dict[str, Any]], None]) -> str:
     if not memory:
         return user_prompt
-    return (
-        "You have the following memories from prior training. Use them if relevant:\n"
-        f"{memory}\n\nTask:\n{user_prompt}"
-    )
+        
+    if isinstance(memory, str):
+        return (
+            "You have the following memories from prior training. Use them if relevant:\n"
+            f"{memory}\n\nTask:\n{user_prompt}"
+        )
+        
+    if isinstance(memory, list):
+        high = []
+        mid = []
+        low = []
+        
+        for mem in memory:
+            if not isinstance(mem, dict):
+                continue
+                
+            metadata = mem.get("metadata", {})
+            bucket = None
+            
+            if isinstance(metadata, dict):
+                bucket = metadata.get("quality_bucket")
+                if bucket is None:
+                    model_extra = metadata.get("model_extra", {})
+                    if isinstance(model_extra, dict):
+                        bucket = model_extra.get("quality_bucket")
+            else:
+                if hasattr(metadata, "model_extra") and metadata.model_extra:
+                    bucket = metadata.model_extra.get("quality_bucket")
+                if bucket is None and hasattr(metadata, "quality_bucket"):
+                    bucket = getattr(metadata, "quality_bucket")
+                    
+            if bucket not in ("high", "mid", "low"):
+                success = None
+                if isinstance(metadata, dict):
+                    success = metadata.get("success")
+                elif hasattr(metadata, "success"):
+                    success = getattr(metadata, "success")
+                    
+                if success is None:
+                    success = mem.get("success")
+                    
+                if success is True:
+                    bucket = "high"
+                elif success is False:
+                    bucket = "low"
+                else:
+                    bucket = "mid"
+                    
+            content = mem.get("memory", mem.get("content", ""))
+            if not content:
+                continue
+                
+            if bucket == "high":
+                high.append(str(content))
+            elif bucket == "low":
+                low.append(str(content))
+            else:
+                mid.append(str(content))
+                
+        parts = ["You have the following retrieved memories to guide your answer:"]
+        if high:
+            parts.append("\n\n--- HIGH-SCORE EXAMPLES (Excellent approaches to follow) ---\n" + "\n\n".join(high))
+        if mid:
+            parts.append("\n\n--- MID-SCORE EXAMPLES (Useful but may have flaws, use with caution) ---\n" + "\n\n".join(mid))
+        if low:
+            parts.append("\n\n--- LOW-SCORE FAILURES (Approaches that failed, avoid these mistakes) ---\n" + "\n\n".join(low))
+            
+        prefix = "".join(parts)
+        return f"{prefix}\n\nTask:\n{user_prompt}"
+        
+    return user_prompt
 
 
 def load_memory_context(path: Path) -> Dict[str, str]:

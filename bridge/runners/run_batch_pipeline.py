@@ -4,6 +4,8 @@ import argparse
 import json
 import logging
 import os
+import signal
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -215,7 +217,10 @@ def parse_args() -> argparse.Namespace:
 def _build_memory_service(args, llm, embedder, temp_dir, *, train_api_base: str):
     from memrl.service.memory_service import MemoryService
     from memrl.service.strategies import (
-        BuildStrategy, RetrieveStrategy, StrategyConfiguration, UpdateStrategy,
+        BuildStrategy,
+        RetrieveStrategy,
+        StrategyConfiguration,
+        UpdateStrategy,
     )
 
     api_key = os.environ.get(args.train_api_key_env, "placeholder")
@@ -258,7 +263,9 @@ def _build_memory_service(args, llm, embedder, temp_dir, *, train_api_base: str)
         "top_k": 5,
     }
     config_path = Path(temp_dir) / "mos_config.json"
-    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     strategy = StrategyConfiguration(
         build=BuildStrategy.PROCEDURALIZATION,
@@ -287,7 +294,9 @@ def _load_jsonl(path: Path) -> list[dict[str, object]]:
     return items
 
 
-def _write_jsonl(path: Path, items: list[dict[str, object]], *, append: bool = False) -> None:
+def _write_jsonl(
+    path: Path, items: list[dict[str, object]], *, append: bool = False
+) -> None:
     if not items:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,9 +310,7 @@ def _load_completed_ids(path: Path) -> set[str]:
     if not path.exists():
         return set()
     return {
-        str(item.get("task_id"))
-        for item in _load_jsonl(path)
-        if item.get("task_id")
+        str(item.get("task_id")) for item in _load_jsonl(path) if item.get("task_id")
     }
 
 
@@ -324,7 +331,9 @@ def _migrate_file(path: Path, batch_idx: int) -> None:
     _clear_file(path)
 
 
-def _filter_results(results: list[dict[str, object]], skip_ids: set[str]) -> list[dict[str, object]]:
+def _filter_results(
+    results: list[dict[str, object]], skip_ids: set[str]
+) -> list[dict[str, object]]:
     if not skip_ids:
         return results
     return [item for item in results if str(item.get("task_id")) not in skip_ids]
@@ -337,7 +346,9 @@ def _iter_batches(
     return [tasks[i : i + batch_size] for i in range(0, len(tasks), batch_size)]
 
 
-def _resolve_latest_snapshot(checkpoint_dir: Path, load_checkpoint: Path | None) -> Path | None:
+def _resolve_latest_snapshot(
+    checkpoint_dir: Path, load_checkpoint: Path | None
+) -> Path | None:
     if load_checkpoint:
         return load_checkpoint
     snapshot_root = checkpoint_dir / "snapshot"
@@ -358,6 +369,7 @@ def _load_results(path: Path, name: str) -> list[dict[str, object]]:
 # ---------------------------------------------------------------------------
 # Resume-train logic
 # ---------------------------------------------------------------------------
+
 
 def _resolve_train_resume(
     resume_train: str | None,
@@ -412,13 +424,23 @@ def _resolve_train_resume(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
+    # Ignore SIGHUP so the process survives terminal/SSH disconnection.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
     args = parse_args()
     stages = _parse_pipeline(args.pipeline)
     resume_train = _parse_resume_train(args.resume_train)
 
     log_path = _build_log_path(args.log_dir, args.log_file)
-    handlers = [logging.FileHandler(log_path), logging.StreamHandler()]
+    file_handler = logging.FileHandler(log_path)
+    # StreamHandler may raise BrokenPipeError when the terminal disconnects.
+    # Only attach it when stderr is a live TTY; otherwise log to file only.
+    handlers: list[logging.Handler] = [file_handler]
+    if sys.stderr and hasattr(sys.stderr, "isatty") and sys.stderr.isatty():
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -436,10 +458,14 @@ def main() -> None:
 
     need_entries = "gen" in stages or "score" in stages
     entries = load_entries(args.dataset_dir) if need_entries else {}
-    memory_context = load_memory_context(args.memory_context) if args.memory_context else {}
+    memory_context = (
+        load_memory_context(args.memory_context) if args.memory_context else {}
+    )
 
     client = SolveClient(
-        base_url=args.base_url, endpoint=args.endpoint, timeout=args.timeout,
+        base_url=args.base_url,
+        endpoint=args.endpoint,
+        timeout=args.timeout,
     )
     settings = SolveSettings(
         base_url=args.base_url,
@@ -479,7 +505,8 @@ def main() -> None:
             temp_dir_ctx = tempfile.TemporaryDirectory(prefix="batch_pipeline_")
             temp_dir = temp_dir_ctx.name
             train_api_base = _resolve_openai_base_url(
-                args.train_base_url, args.train_endpoint,
+                args.train_base_url,
+                args.train_endpoint,
             )
             train_llm = OpenAILLM(
                 api_key=train_api_key,
@@ -495,7 +522,11 @@ def main() -> None:
             )
             try:
                 memory_service = _build_memory_service(
-                    args, train_llm, embedder, temp_dir, train_api_base=train_api_base,
+                    args,
+                    train_llm,
+                    embedder,
+                    temp_dir,
+                    train_api_base=train_api_base,
                 )
             except Exception as exc:
                 _log.warning(
@@ -506,11 +537,15 @@ def main() -> None:
 
     # --- Resolve resume-train ---
     should_clear_trained, skip_train_ids = _resolve_train_resume(
-        resume_train, stages, args.trained_output,
+        resume_train,
+        stages,
+        args.trained_output,
     )
 
     resume_gen_score = args.resume_gen_score
-    skip_gen_score_ids = _load_completed_ids(resume_gen_score) if resume_gen_score else set()
+    skip_gen_score_ids = (
+        _load_completed_ids(resume_gen_score) if resume_gen_score else set()
+    )
 
     try:
         pipeline = BatchPipeline(
@@ -530,16 +565,20 @@ def main() -> None:
         )
 
         if args.mode == "memrl" and memory_service is not None:
-            snapshot_dir = _resolve_latest_snapshot(args.checkpoint_dir, args.load_checkpoint)
+            snapshot_dir = _resolve_latest_snapshot(
+                args.checkpoint_dir, args.load_checkpoint
+            )
             if snapshot_dir:
                 try:
                     memory_service.load_checkpoint_snapshot(str(snapshot_dir))
                     _log.info(
-                        "Loaded checkpoint snapshot from %s", snapshot_dir,
+                        "Loaded checkpoint snapshot from %s",
+                        snapshot_dir,
                     )
                 except Exception as exc:
                     _log.warning(
-                        "Failed to load checkpoint snapshot (%s)", exc,
+                        "Failed to load checkpoint snapshot (%s)",
+                        exc,
                     )
 
         # ---------------------------------------------------------------
@@ -577,12 +616,14 @@ def main() -> None:
                     if args.mode == "plain" and idx == 0:
                         _log.info(
                             "Batch %d/%d: plain mode (no memory augmentation)",
-                            batch_idx, total_batches,
+                            batch_idx,
+                            total_batches,
                         )
                     elif args.mode == "plain":
                         _log.info(
                             "Batch %d/%d: memrl mode (using accumulated memories)",
-                            batch_idx, total_batches,
+                            batch_idx,
+                            total_batches,
                         )
 
                     # After the first batch: migrate output files to *_batch{N}.ext
@@ -613,16 +654,23 @@ def main() -> None:
 
                     if trained_records:
                         skip_train_ids.update(
-                            {str(item.get("task_id")) for item in trained_records if item.get("task_id")}
+                            {
+                                str(item.get("task_id"))
+                                for item in trained_records
+                                if item.get("task_id")
+                            }
                         )
                     if last_checkpoint and memory_service is not None:
                         snapshot_root = Path(last_checkpoint.get("cube_dir", "")).parent
                         if snapshot_root.exists():
                             try:
-                                memory_service.load_checkpoint_snapshot(str(snapshot_root))
+                                memory_service.load_checkpoint_snapshot(
+                                    str(snapshot_root)
+                                )
                             except Exception as exc:
                                 _log.warning(
-                                    "Failed to reload checkpoint (%s)", exc,
+                                    "Failed to reload checkpoint (%s)",
+                                    exc,
                                 )
 
                 pipeline.print_summary(all_results)
@@ -651,7 +699,9 @@ def main() -> None:
         pipeline.init_output_files(append=False)
 
         if "gen" in stages and "score" in stages:
-            results = pipeline.generate_and_score(entries, mode=args.mode, resume_from=resume_gen_score)
+            results = pipeline.generate_and_score(
+                entries, mode=args.mode, resume_from=resume_gen_score
+            )
             pipeline.print_summary(results)
             if need_train:
                 filtered = _filter_results(results, skip_train_ids)
@@ -665,12 +715,16 @@ def main() -> None:
             return
 
         if "gen" in stages and "score" not in stages:
-            results = pipeline.generate(entries, mode=args.mode, resume_from=resume_gen_score)
+            results = pipeline.generate(
+                entries, mode=args.mode, resume_from=resume_gen_score
+            )
             return
 
         if "score" in stages and "gen" not in stages:
             if not entries:
-                raise SystemExit("Scoring requires dataset entries; enable gen/score stages")
+                raise SystemExit(
+                    "Scoring requires dataset entries; enable gen/score stages"
+                )
             results = _load_results(args.generated_output, "Generated output")
             results = _filter_results(results, skip_gen_score_ids)
             scored, trained_records, last_checkpoint = pipeline.score_streaming(

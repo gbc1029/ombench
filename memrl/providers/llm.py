@@ -13,19 +13,32 @@ import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
+
 try:
-    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    from tenacity import (
+        retry,
+        stop_after_attempt,
+        wait_exponential,
+        retry_if_exception_type,
+    )
 except Exception:  # fallback if tenacity is unavailable
+
     def retry(*args, **kwargs):
         def deco(fn):
             return fn
+
         return deco
+
     def stop_after_attempt(*args, **kwargs):
         return None
+
     def wait_exponential(*args, **kwargs):
         return None
+
     def retry_if_exception_type(*args, **kwargs):
         return None
+
+
 import logging
 
 from .base import BaseLLM, LLMError
@@ -34,11 +47,11 @@ from .base import BaseLLM, LLMError
 class OpenAILLM(BaseLLM):
     """
     OpenAI-compatible LLM provider.
-    
+
     Supports both OpenAI's official API and any OpenAI-compatible services
     (like local models served via vLLM, ollama, etc.).
     """
-    
+
     def __init__(
         self,
         api_key: str,
@@ -48,11 +61,11 @@ class OpenAILLM(BaseLLM):
         default_max_tokens: Optional[int] = None,
         token_log_dir: Optional[str] = None,
         token_log_path: Optional[str] = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         """
         Initialize OpenAI LLM provider.
-        
+
         Args:
             api_key: API key for authentication
             base_url: Base URL for API (None for official OpenAI)
@@ -72,13 +85,15 @@ class OpenAILLM(BaseLLM):
         self.default_temperature = default_temperature
         self.default_max_tokens = default_max_tokens
         self._token_log_lock = threading.Lock()
-        self._token_log_path = self._resolve_token_log_path(token_log_path, token_log_dir)
+        self._token_log_path = self._resolve_token_log_path(
+            token_log_path, token_log_dir
+        )
 
         # Initialize OpenAI client
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
-            
+
         try:
             self.client = OpenAI(**client_kwargs)
         except Exception as e:
@@ -130,16 +145,26 @@ class OpenAILLM(BaseLLM):
         if usage is None:
             return {}
         payload: Dict[str, Any] = {}
-        for key in ["prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"]:
+        for key in [
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+        ]:
             val = getattr(usage, key, None)
             if val is not None:
                 payload[key] = val
         completion_details = getattr(usage, "completion_tokens_details", None)
         prompt_details = getattr(usage, "prompt_tokens_details", None)
         if completion_details is not None:
-            payload["completion_tokens_details"] = self._usage_details_to_dict(completion_details)
+            payload["completion_tokens_details"] = self._usage_details_to_dict(
+                completion_details
+            )
         if prompt_details is not None:
-            payload["prompt_tokens_details"] = self._usage_details_to_dict(prompt_details)
+            payload["prompt_tokens_details"] = self._usage_details_to_dict(
+                prompt_details
+            )
         if payload:
             return payload
         try:
@@ -180,27 +205,29 @@ class OpenAILLM(BaseLLM):
         try:
             text = json.dumps(entry, ensure_ascii=False, default=str)
         except Exception:
-            text = json.dumps({"ts": entry.get("ts"), "payload": str(payload)}, ensure_ascii=False)
+            text = json.dumps(
+                {"ts": entry.get("ts"), "payload": str(payload)}, ensure_ascii=False
+            )
         with self._token_log_lock:
             with open(self._token_log_path, "a", encoding="utf-8") as f:
                 f.write(text + "\n")
-    
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type(Exception)
+        retry=retry_if_exception_type(Exception),
     )
     def generate(self, messages: List[Dict[str, str]], **kwargs: Any) -> str:
         """
         Generate response using OpenAI Chat Completions API.
-        
+
         Args:
             messages: List of message dictionaries with 'role' and 'content'
             **kwargs: Generation parameters (temperature, max_tokens, etc.)
-            
+
         Returns:
             Generated response text
-            
+
         Raises:
             LLMError: If generation fails after retries
         """
@@ -222,14 +249,16 @@ class OpenAILLM(BaseLLM):
 
         if "max_tokens" in kwargs:
             generation_kwargs["max_tokens"] = kwargs.get("max_tokens")
+            generation_kwargs["max_completion_tokens"] = kwargs.get("max_tokens")
         elif self.default_max_tokens is not None:
             generation_kwargs["max_tokens"] = self.default_max_tokens
-        
+            generation_kwargs["max_completion_tokens"] = self.default_max_tokens
+
         # Add any additional kwargs
         for key, value in kwargs.items():
             if key not in generation_kwargs:
                 generation_kwargs[key] = value
-        
+
         try:
             response = self.client.chat.completions.create(**generation_kwargs)
             # Inspect finish_reason and usage for diagnostics
@@ -258,7 +287,11 @@ class OpenAILLM(BaseLLM):
                         "provider": "llm",
                         "model": getattr(response, "model", self.model),
                         "base_url": self.base_url,
-                        "request_params": {k: v for k, v in generation_kwargs.items() if k != "messages"},
+                        "request_params": {
+                            k: v
+                            for k, v in generation_kwargs.items()
+                            if k != "messages"
+                        },
                         "prompt_stats": self._summarize_messages(messages),
                         "usage": usage_payload,
                         "finish_reason": finish_reason,
@@ -279,7 +312,11 @@ class OpenAILLM(BaseLLM):
                         "provider": "llm",
                         "model": self.model,
                         "base_url": self.base_url,
-                        "request_params": {k: v for k, v in generation_kwargs.items() if k != "messages"},
+                        "request_params": {
+                            k: v
+                            for k, v in generation_kwargs.items()
+                            if k != "messages"
+                        },
                         "prompt_stats": self._summarize_messages(messages),
                         "error": str(e),
                         "status": status,
@@ -296,68 +333,80 @@ class OpenAILLM(BaseLLM):
                 exc_info=True,
             )
             raise LLMError(f"Failed to generate response: {e}") from e
-    
+
+    @staticmethod
+    def _strip_think_tags(text: str) -> str:
+        """Remove <think>...</think> blocks that reasoning models may emit."""
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
     @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=2, max=5)
+        stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=5)
     )
     def extract_keywords(self, text: str, max_keywords: int = 8) -> List[str]:
         """
         Extract keywords from text using LLM.
-        
+
         This method uses the LLM to identify key concepts that can be used
         for the AveFact retrieval strategy.
-        
+
         Args:
             text: Input text to analyze
             max_keywords: Maximum number of keywords to extract
-            
+
         Returns:
             List of extracted keywords
-            
+
         Raises:
             LLMError: If keyword extraction fails
         """
-        prompt = f"""
-        Extract up to {max_keywords} key concepts or keywords from the following text.
-        Focus on the most important nouns, actions, and specific entities.
-        Return only the keywords separated by commas, nothing else.
-        
-        Text: {text}
-        
-        Keywords:"""
-        
+        truncated_text = text[:2000] if len(text) > 2000 else text
+        prompt = (
+            "/no_think\n"
+            f"Extract up to {max_keywords} keywords from the text below. "
+            "Output ONLY a comma-separated list of keywords, nothing else. "
+            "Do NOT explain, reason, or think step by step.\n\n"
+            f"Text: {truncated_text}\n\n"
+            "Keywords:"
+        )
+
         messages = [{"role": "user", "content": prompt}]
-        
+
         try:
-            response = self.generate(messages, temperature=0, max_tokens=100)
-            
-            # Parse keywords from response
-            keywords_text = response.strip()
-            
+            response = self.generate(
+                messages,
+                temperature=0,
+                max_tokens=200,
+                extra_body={
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            )
+
+            # Strip any residual <think>...</think> blocks from reasoning models
+            keywords_text = self._strip_think_tags(response).strip()
+
             # Split by commas and clean up
             keywords = []
-            for keyword in keywords_text.split(','):
+            for keyword in keywords_text.split(","):
                 keyword = keyword.strip().lower()
                 # Remove quotes and extra whitespace
-                keyword = re.sub(r'^["\']|["\']$', '', keyword)
-                keyword = re.sub(r'\s+', ' ', keyword)
-                
+                keyword = re.sub(r'^["\']|["\']$', "", keyword)
+                keyword = re.sub(r"\s+", " ", keyword)
+
                 if keyword and len(keyword) > 1:  # Filter out single characters
                     keywords.append(keyword)
-            
+
             return keywords[:max_keywords]
-            
+
         except Exception as e:
             raise LLMError(f"Failed to extract keywords: {e}")
-    
+
     def generate_script(self, trajectory: str) -> str:
         """
         Generate high-level script from trajectory.
-        
+
         Args:
             trajectory: Detailed task trajectory
-            
+
         Returns:
             High-level script representation
         """
@@ -375,23 +424,29 @@ class OpenAILLM(BaseLLM):
         {trajectory}
         
         High-level script:"""
-        
+
         messages = [{"role": "user", "content": prompt}]
-        return self.generate(messages, temperature=self.default_temperature, max_tokens=self.default_max_tokens)
+        return self.generate(
+            messages,
+            temperature=self.default_temperature,
+            max_tokens=self.default_max_tokens,
+        )
 
 
 class MockLLM(BaseLLM):
     """
     Mock LLM provider for testing purposes.
-    
+
     This provider returns predefined responses and is useful for
     unit testing without making actual API calls.
     """
-    
-    def __init__(self, responses: Optional[Dict[str, str]] = None, **kwargs: Any) -> None:
+
+    def __init__(
+        self, responses: Optional[Dict[str, str]] = None, **kwargs: Any
+    ) -> None:
         """
         Initialize mock LLM provider.
-        
+
         Args:
             responses: Dictionary mapping input patterns to responses
             **kwargs: Additional configuration parameters
@@ -399,26 +454,26 @@ class MockLLM(BaseLLM):
         super().__init__(**kwargs)
         self.responses = responses or {}
         self.call_count = 0
-    
+
     def generate(self, messages: List[Dict[str, str]], **kwargs: Any) -> str:
         """Generate mock response."""
         self.call_count += 1
-        
+
         # Extract the user message content
         user_content = ""
         for msg in messages:
             if msg.get("role") == "user":
                 user_content = msg.get("content", "")
                 break
-        
+
         # Check for predefined responses
         for pattern, response in self.responses.items():
             if pattern.lower() in user_content.lower():
                 return response
-        
+
         # Default response
         return f"Mock response {self.call_count} for: {user_content[:50]}..."
-    
+
     def extract_keywords(self, text: str, max_keywords: int = 8) -> List[str]:
         """Extract mock keywords."""
         # Simple keyword extraction for testing

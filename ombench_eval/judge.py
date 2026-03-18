@@ -104,7 +104,7 @@ def _extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
                 elif char == "]":
                     bracket_count -= 1
                     if bracket_count == 0:
-                        candidate = text[start:i + 1]
+                        candidate = text[start : i + 1]
                         try:
                             parsed = _clean_and_parse_json(candidate)
                             if isinstance(parsed, list):
@@ -116,7 +116,7 @@ def _extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
     first_bracket = text.find("[")
     last_bracket = text.rfind("]")
     if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
-        candidate = text[first_bracket:last_bracket + 1]
+        candidate = text[first_bracket : last_bracket + 1]
         try:
             parsed = _clean_and_parse_json(candidate)
             if isinstance(parsed, list):
@@ -141,7 +141,7 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     if start == -1 or end == -1 or end <= start:
         return None
     try:
-        parsed = json.loads(text[start:end + 1])
+        parsed = json.loads(text[start : end + 1])
         if isinstance(parsed, dict):
             return parsed
     except json.JSONDecodeError:
@@ -171,7 +171,9 @@ def parse_rubric_array(
 
         met_field = item.get("met")
         if met_field is not None:
-            binary_score = 1 if met_field is True or str(met_field).lower() in ("true", "1") else 0
+            binary_score = (
+                1 if met_field is True or str(met_field).lower() in ("true", "1") else 0
+            )
         else:
             binary_score = 1 if status in YES_VALUES else 0
 
@@ -225,12 +227,14 @@ def convert_scores(
         bs = raw["binary_score"]
 
         if bs == "NA":
-            rubric_results.append({
-                "rubric_number": rubric_num,
-                "weight": weight,
-                "met": None,
-                "reason": raw.get("justification", "解析失败"),
-            })
+            rubric_results.append(
+                {
+                    "rubric_number": rubric_num,
+                    "weight": weight,
+                    "met": None,
+                    "reason": raw.get("justification", "解析失败"),
+                }
+            )
             continue
 
         has_valid = True
@@ -238,12 +242,14 @@ def convert_scores(
         if met:
             score += weight
 
-        rubric_results.append({
-            "rubric_number": rubric_num,
-            "weight": weight,
-            "met": met,
-            "reason": raw.get("justification", ""),
-        })
+        rubric_results.append(
+            {
+                "rubric_number": rubric_num,
+                "weight": weight,
+                "met": met,
+                "reason": raw.get("justification", ""),
+            }
+        )
 
     if not has_valid:
         max_score = 0
@@ -261,6 +267,13 @@ def _extract_answer_text(response: Dict[str, Any]) -> str:
     Qwen3.5 thinking mode returns content=null with the actual text in
     message.reasoning.  We try content first, then fall back to reasoning.
     """
+    if not isinstance(response, dict):
+        return ""
+    result = response.get("result")
+    if isinstance(result, dict):
+        answer = result.get("answer")
+        if isinstance(answer, str) and answer.strip():
+            return answer.strip()
     choices = response.get("choices", [])
     if not choices:
         return ""
@@ -320,7 +333,9 @@ class OpenAIJudge(BaseJudge):
             return {"choices": [{"message": {"content": "[]"}}]}
 
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(self.url, data=data, headers=self.headers, method="POST")
+        req = urllib.request.Request(
+            self.url, data=data, headers=self.headers, method="POST"
+        )
         t0 = time.monotonic()
         send_ts = time.strftime("%Y-%m-%d %H:%M:%S")
         logger.info("[SCORE] send=%s timeout=%s", send_ts, self.settings.timeout)
@@ -335,14 +350,25 @@ class OpenAIJudge(BaseJudge):
             elapsed = time.monotonic() - t0
             recv_ts = time.strftime("%Y-%m-%d %H:%M:%S")
             err_body = exc.read().decode("utf-8", errors="replace")
-            logger.error("[SCORE] fail=%s elapsed=%.1fs timeout=%s HTTP_%d: %s",
-                         recv_ts, elapsed, self.settings.timeout, exc.code, err_body)
+            logger.error(
+                "[SCORE] fail=%s elapsed=%.1fs timeout=%s HTTP_%d: %s",
+                recv_ts,
+                elapsed,
+                self.settings.timeout,
+                exc.code,
+                err_body,
+            )
             raise RuntimeError(f"Judge API HTTP {exc.code}: {err_body}") from exc
         except Exception as exc:
             elapsed = time.monotonic() - t0
             recv_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-            logger.error("[SCORE] fail=%s elapsed=%.1fs timeout=%s error=%s",
-                         recv_ts, elapsed, self.settings.timeout, exc)
+            logger.error(
+                "[SCORE] fail=%s elapsed=%.1fs timeout=%s error=%s",
+                recv_ts,
+                elapsed,
+                self.settings.timeout,
+                exc,
+            )
             raise
 
     def judge(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
@@ -355,7 +381,11 @@ class OpenAIJudge(BaseJudge):
                 answer_text = _extract_answer_text(response)
                 if not answer_text:
                     last_error = ValueError("Empty answer from judge")
-                    logger.warning("Judge returned empty answer (attempt %d/%d)", attempt + 1, max_retries)
+                    logger.warning(
+                        "Judge returned empty answer (attempt %d/%d)",
+                        attempt + 1,
+                        max_retries,
+                    )
                     continue
 
                 last_answer_text = answer_text
@@ -375,14 +405,30 @@ class OpenAIJudge(BaseJudge):
                             "raw": "single_rubric_object",
                             "raw_response": answer_text,
                         }
-                    return {"rubric_array": [], "raw": answer_text, "raw_response": answer_text}
+                    return {
+                        "rubric_array": [],
+                        "raw": answer_text,
+                        "raw_response": answer_text,
+                    }
 
-                last_error = ValueError(f"Could not parse judge response as JSON array: {answer_text[:200]}")
-                logger.warning("JSON parse failed (attempt %d/%d): %s", attempt + 1, max_retries, answer_text[:200])
+                last_error = ValueError(
+                    f"Could not parse judge response as JSON array: {answer_text[:200]}"
+                )
+                logger.warning(
+                    "JSON parse failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    max_retries,
+                    answer_text[:200],
+                )
 
             except Exception as exc:
                 last_error = exc
-                logger.warning("Judge API call failed (attempt %d/%d): %s", attempt + 1, max_retries, exc)
+                logger.warning(
+                    "Judge API call failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    max_retries,
+                    exc,
+                )
 
         return {
             "rubric_array": [],

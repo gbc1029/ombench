@@ -10,7 +10,15 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import sys
+
 from tqdm import tqdm
+
+# Disable tqdm progress bars when stderr is not a TTY (e.g. nohup, redirected
+# output, or after an SSH disconnect) to prevent BrokenPipeError.
+_TQDM_DISABLE = not (
+    sys.stderr and hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+)
 
 from experiment.client.solver import SolveClient
 from experiment.config.settings import SolveSettings
@@ -45,12 +53,118 @@ def _is_score_timeout(item: Dict[str, Any]) -> bool:
 def _extract_answer(response: Dict[str, Any]) -> str:
     if not isinstance(response, dict):
         return ""
+    # Format 1: solve API  →  response["result"]["answer"]
     result = response.get("result")
     if isinstance(result, dict):
         answer = result.get("answer")
-        if isinstance(answer, str):
-            return answer
+        if isinstance(answer, str) and answer.strip():
+            return answer.strip()
+    # Format 2: OpenAI-style  →  response["choices"][0]["message"]["content"]
+    choices = response.get("choices", [])
+    if not choices:
+        return ""
+    message = choices[0].get("message", {})
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    reasoning = message.get("reasoning")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip()
     return ""
+
+
+def _score_ratio(score_info: Any) -> Optional[float]:
+    if not isinstance(score_info, dict):
+        return None
+    max_score = score_info.get("max_score")
+    if not max_score:
+        return None
+    try:
+        return float(score_info.get("score", 0)) / float(max_score)
+    except Exception:
+        return None
+
+
+SCORE_BUCKET_MID = 0.3
+SCORE_BUCKET_HIGH = 0.6
+RETRIEVE_THRESHOLD = 0.35
+RETRIEVE_K = 3
+
+
+def _score_bucket(ratio: Optional[float]) -> str:
+    if ratio is None:
+        return "unknown"
+    if ratio >= SCORE_BUCKET_HIGH:
+        return "high"
+    if ratio >= SCORE_BUCKET_MID:
+        return "mid"
+    return "low"
+
+
+def _extract_meta_value(meta: Any, key: str) -> Any:
+    if meta is None:
+        return None
+    model_extra = getattr(meta, "model_extra", None)
+    if isinstance(model_extra, dict) and key in model_extra:
+        return model_extra.get(key)
+    if isinstance(meta, dict):
+        return meta.get(key)
+    return getattr(meta, key, None)
+
+
+def _format_memory_sections(memories: List[Dict[str, Any]]) -> Optional[str]:
+    if not memories:
+        return None
+
+    buckets = {"high": [], "mid": [], "low": [], "unknown": []}
+    for mem in memories:
+        metadata = mem.get("metadata") if isinstance(mem, dict) else None
+        ratio = _extract_meta_value(metadata, "score_ratio")
+        if ratio is None:
+            success = _extract_meta_value(metadata, "success")
+            if success is True:
+                bucket = "mid"
+            elif success is False:
+                bucket = "low"
+            else:
+                bucket = "unknown"
+        else:
+            bucket = _score_bucket(float(ratio))
+        buckets[bucket].append(mem)
+
+    sections: List[str] = []
+    if buckets["high"]:
+        sections.append(
+            "--- HIGH-SCORE MEMORIES (follow) ---\n"
+            + "\n\n".join(
+                m.get("content", "") for m in buckets["high"] if isinstance(m, dict)
+            )
+        )
+    if buckets["mid"]:
+        sections.append(
+            "--- MID-SCORE MEMORIES (use with caution) ---\n"
+            + "\n\n".join(
+                m.get("content", "") for m in buckets["mid"] if isinstance(m, dict)
+            )
+        )
+    if buckets["low"]:
+        sections.append(
+            "--- LOW-SCORE FAILURES (avoid) ---\n"
+            + "\n\n".join(
+                m.get("content", "") for m in buckets["low"] if isinstance(m, dict)
+            )
+        )
+    if buckets["unknown"]:
+        sections.append(
+            "--- OTHER MEMORIES ---\n"
+            + "\n\n".join(
+                m.get("content", "") for m in buckets["unknown"] if isinstance(m, dict)
+            )
+        )
+
+    return "\n\n".join(s for s in sections if s.strip())
 
 
 def _load_completed_ids(path: Path) -> set:
@@ -163,7 +277,9 @@ class BatchPipeline:
             record["response"] = item.get("response")
         return record
 
-    def _score_item(self, item: Dict[str, Any], entry: Dict[str, Any]) -> Dict[str, Any]:
+    def _score_item(
+        self, item: Dict[str, Any], entry: Dict[str, Any]
+    ) -> Dict[str, Any]:
         try:
             score = score_response(
                 judge=self.judge,
@@ -172,8 +288,15 @@ class BatchPipeline:
                 rubrics=entry.get("rubrics", []),
                 system_prompt=entry.get("system_prompt"),
             )
-            if isinstance(score, dict) and score.get("raw") in ("single_rubric_object", "incomplete_rubric_array"):
-                logger.warning("Task %s score parse incomplete: %s", item.get("task_id"), score.get("raw"))
+            if isinstance(score, dict) and score.get("raw") in (
+                "single_rubric_object",
+                "incomplete_rubric_array",
+            ):
+                logger.warning(
+                    "Task %s score parse incomplete: %s",
+                    item.get("task_id"),
+                    score.get("raw"),
+                )
             item["score"] = score
         except Exception as exc:
             is_timeout = _is_timeout_error(exc)
@@ -196,16 +319,27 @@ class BatchPipeline:
         if mode == "memrl":
             if self.memory_service is not None:
                 try:
-                    retrieval = self.memory_service.retrieve_value_aware(user_prompt)
-                    selected = retrieval.get("selected") if isinstance(retrieval, dict) else None
-                    memory_text = None
+                    retrieval = self.memory_service.retrieve_value_aware(
+                        user_prompt, k=RETRIEVE_K, threshold=RETRIEVE_THRESHOLD
+                    )
+                    selected = (
+                        retrieval.get("selected")
+                        if isinstance(retrieval, dict)
+                        else None
+                    )
+                    memories: List[Dict[str, Any]] = []
                     if isinstance(selected, dict):
-                        memory_text = selected.get("content")
+                        memories = [selected]
+                    elif isinstance(selected, list):
+                        memories = [m for m in selected if isinstance(m, dict)]
+                    memory_text = _format_memory_sections(memories)
                     user_prompt = apply_memory(user_prompt, memory_text)
                 except Exception as exc:
                     logger.warning("Memory retrieval failed for %s: %s", task_id, exc)
             elif self.memory_context:
-                user_prompt = apply_memory(user_prompt, self.memory_context.get(task_id))
+                user_prompt = apply_memory(
+                    user_prompt, self.memory_context.get(task_id)
+                )
         return {"system_prompt": system_prompt, "user_prompt": user_prompt}
 
     def _generate_one_direct(
@@ -224,7 +358,9 @@ class BatchPipeline:
             },
         )
         response = self.client.solve_with_retry(
-            payload, dry_run=self.dry_run, max_retries=self.max_retries,
+            payload,
+            dry_run=self.dry_run,
+            max_retries=self.max_retries,
         )
         result = {
             "task_id": task_id,
@@ -246,7 +382,9 @@ class BatchPipeline:
     ) -> List[tuple[str, Dict[str, Any]]]:
         skip_ids = _load_completed_ids(resume_from) if resume_from else set()
         if skip_ids:
-            logger.info("Resuming: skipping %d already-completed task(s)", len(skip_ids))
+            logger.info(
+                "Resuming: skipping %d already-completed task(s)", len(skip_ids)
+            )
 
         tasks = [
             (task_id, entry)
@@ -305,11 +443,24 @@ class BatchPipeline:
             }
             gen_desc = _batch_desc("Generate", batch_idx, total_batches)
             bars = [
-                tqdm(total=len(future_map), desc=gen_desc, unit="task", position=0),
+                tqdm(
+                    total=len(future_map),
+                    desc=gen_desc,
+                    unit="task",
+                    position=0,
+                    disable=_TQDM_DISABLE,
+                ),
             ]
             if total_batches > 1:
                 bars.append(
-                    tqdm(total=effective_global_total, desc="Overall Generate", unit="task", initial=global_offset, position=1),
+                    tqdm(
+                        total=effective_global_total,
+                        desc="Overall Generate",
+                        unit="task",
+                        initial=global_offset,
+                        position=1,
+                        disable=_TQDM_DISABLE,
+                    ),
                 )
             try:
                 for future in as_completed(future_map):
@@ -324,11 +475,15 @@ class BatchPipeline:
                             "response": None,
                             "answer": "",
                             "error": str(exc),
-                            "error_type": "timeout" if _is_timeout_error(exc) else "error",
+                            "error_type": "timeout"
+                            if _is_timeout_error(exc)
+                            else "error",
                             "stage": "generate",
                         }
                         results.append(result)
-                    self._append_jsonl(self.generated_output, self._format_generated(result))
+                    self._append_jsonl(
+                        self.generated_output, self._format_generated(result)
+                    )
                     for bar in bars:
                         bar.update(1)
             finally:
@@ -380,22 +535,48 @@ class BatchPipeline:
 
             pos = 0
             bars = [
-                tqdm(total=len(tasks), desc=gen_desc, unit="task", position=pos),
+                tqdm(
+                    total=len(tasks),
+                    desc=gen_desc,
+                    unit="task",
+                    position=pos,
+                    disable=_TQDM_DISABLE,
+                ),
             ]
             pos += 1
             if total_batches > 1:
                 bars.append(
-                    tqdm(total=effective_global_total, desc="Overall Generate", unit="task", initial=global_offset, position=pos),
+                    tqdm(
+                        total=effective_global_total,
+                        desc="Overall Generate",
+                        unit="task",
+                        initial=global_offset,
+                        position=pos,
+                        disable=_TQDM_DISABLE,
+                    ),
                 )
                 pos += 1
             score_bar_idx = len(bars)
             bars.append(
-                tqdm(total=len(tasks), desc=score_desc, unit="task", position=pos),
+                tqdm(
+                    total=len(tasks),
+                    desc=score_desc,
+                    unit="task",
+                    position=pos,
+                    disable=_TQDM_DISABLE,
+                ),
             )
             pos += 1
             if total_batches > 1:
                 bars.append(
-                    tqdm(total=effective_global_total, desc="Overall Score", unit="task", initial=global_offset, position=pos),
+                    tqdm(
+                        total=effective_global_total,
+                        desc="Overall Score",
+                        unit="task",
+                        initial=global_offset,
+                        position=pos,
+                        disable=_TQDM_DISABLE,
+                    ),
                 )
 
             try:
@@ -416,18 +597,26 @@ class BatchPipeline:
                                     "response": None,
                                     "answer": "",
                                     "error": str(exc),
-                                    "error_type": "timeout" if _is_timeout_error(exc) else "error",
+                                    "error_type": "timeout"
+                                    if _is_timeout_error(exc)
+                                    else "error",
                                     "stage": "generate",
                                     "score": None,
                                 }
 
-                            self._append_jsonl(self.generated_output, self._format_generated(result))
+                            self._append_jsonl(
+                                self.generated_output, self._format_generated(result)
+                            )
                             gen_done += 1
                             bars[0].update(1)
                             if total_batches > 1:
                                 bars[1].update(1)
 
-                            if result.get("answer") and not result.get("error") and not _is_gen_timeout(result):
+                            if (
+                                result.get("answer")
+                                and not result.get("error")
+                                and not _is_gen_timeout(result)
+                            ):
                                 entry = task_map.get(tid, {})
                                 sf = score_pool.submit(self._score_item, result, entry)
                                 score_futures[sf] = tid
@@ -435,7 +624,9 @@ class BatchPipeline:
                             else:
                                 result["score"] = None
                                 results.append(result)
-                                self._append_jsonl(self.scored_output, self._format_scored(result))
+                                self._append_jsonl(
+                                    self.scored_output, self._format_scored(result)
+                                )
                                 score_done += 1
                                 bars[score_bar_idx].update(1)
                                 if total_batches > 1:
@@ -452,7 +643,9 @@ class BatchPipeline:
                                     "score": {"raw": str(exc)},
                                 }
                             results.append(scored_result)
-                            self._append_jsonl(self.scored_output, self._format_scored(scored_result))
+                            self._append_jsonl(
+                                self.scored_output, self._format_scored(scored_result)
+                            )
                             score_done += 1
                             bars[score_bar_idx].update(1)
                             if total_batches > 1:
@@ -489,7 +682,10 @@ class BatchPipeline:
 
         logger.info(
             "Pipeline: %d tasks, gen_workers=%d, score_workers=%d, mode=%s",
-            len(tasks), self.workers, self.score_workers, mode,
+            len(tasks),
+            self.workers,
+            self.score_workers,
+            mode,
         )
 
         gen_desc = _batch_desc("Generate", batch_idx, total_batches)
@@ -509,30 +705,69 @@ class BatchPipeline:
             pos = 0
             bars: List[Any] = []
 
-            gen_bar = tqdm(total=len(tasks), desc=gen_desc, unit="task", position=pos)
+            gen_bar = tqdm(
+                total=len(tasks),
+                desc=gen_desc,
+                unit="task",
+                position=pos,
+                disable=_TQDM_DISABLE,
+            )
             bars.append(gen_bar)
             pos += 1
             gen_overall_bar = None
             if total_batches > 1:
-                gen_overall_bar = tqdm(total=effective_global_total, desc="Overall Generate", unit="task", initial=global_offset, position=pos)
+                gen_overall_bar = tqdm(
+                    total=effective_global_total,
+                    desc="Overall Generate",
+                    unit="task",
+                    initial=global_offset,
+                    position=pos,
+                    disable=_TQDM_DISABLE,
+                )
                 bars.append(gen_overall_bar)
                 pos += 1
 
-            score_bar = tqdm(total=len(tasks), desc=score_desc, unit="task", position=pos)
+            score_bar = tqdm(
+                total=len(tasks),
+                desc=score_desc,
+                unit="task",
+                position=pos,
+                disable=_TQDM_DISABLE,
+            )
             bars.append(score_bar)
             pos += 1
             score_overall_bar = None
             if total_batches > 1:
-                score_overall_bar = tqdm(total=effective_global_total, desc="Overall Score", unit="task", initial=global_offset, position=pos)
+                score_overall_bar = tqdm(
+                    total=effective_global_total,
+                    desc="Overall Score",
+                    unit="task",
+                    initial=global_offset,
+                    position=pos,
+                    disable=_TQDM_DISABLE,
+                )
                 bars.append(score_overall_bar)
                 pos += 1
 
-            train_bar = tqdm(total=len(tasks), desc=train_desc, unit="task", position=pos)
+            train_bar = tqdm(
+                total=len(tasks),
+                desc=train_desc,
+                unit="task",
+                position=pos,
+                disable=_TQDM_DISABLE,
+            )
             bars.append(train_bar)
             pos += 1
             train_overall_bar = None
             if total_batches > 1:
-                train_overall_bar = tqdm(total=effective_global_total, desc="Overall Train", unit="task", initial=global_offset, position=pos)
+                train_overall_bar = tqdm(
+                    total=effective_global_total,
+                    desc="Overall Train",
+                    unit="task",
+                    initial=global_offset,
+                    position=pos,
+                    disable=_TQDM_DISABLE,
+                )
                 bars.append(train_overall_bar)
 
             try:
@@ -553,17 +788,25 @@ class BatchPipeline:
                                     "response": None,
                                     "answer": "",
                                     "error": str(exc),
-                                    "error_type": "timeout" if _is_timeout_error(exc) else "error",
+                                    "error_type": "timeout"
+                                    if _is_timeout_error(exc)
+                                    else "error",
                                     "stage": "generate",
                                     "score": None,
                                 }
 
-                            self._append_jsonl(self.generated_output, self._format_generated(result))
+                            self._append_jsonl(
+                                self.generated_output, self._format_generated(result)
+                            )
                             gen_bar.update(1)
                             if gen_overall_bar:
                                 gen_overall_bar.update(1)
 
-                            if result.get("answer") and not result.get("error") and not _is_gen_timeout(result):
+                            if (
+                                result.get("answer")
+                                and not result.get("error")
+                                and not _is_gen_timeout(result)
+                            ):
                                 entry = task_map.get(tid, {})
                                 sf = score_pool.submit(self._score_item, result, entry)
                                 score_futures[sf] = tid
@@ -571,7 +814,9 @@ class BatchPipeline:
                             else:
                                 result["score"] = None
                                 results.append(result)
-                                self._append_jsonl(self.scored_output, self._format_scored(result))
+                                self._append_jsonl(
+                                    self.scored_output, self._format_scored(result)
+                                )
                                 score_bar.update(1)
                                 if score_overall_bar:
                                     score_overall_bar.update(1)
@@ -587,15 +832,24 @@ class BatchPipeline:
                                 logger.error("Task %s score failed: %s", tid, exc)
                                 scored_result = {
                                     "task_id": tid,
-                                    "score": {"error_type": "timeout" if _is_timeout_error(exc) else "error", "raw": str(exc)},
+                                    "score": {
+                                        "error_type": "timeout"
+                                        if _is_timeout_error(exc)
+                                        else "error",
+                                        "raw": str(exc),
+                                    },
                                 }
                             results.append(scored_result)
-                            self._append_jsonl(self.scored_output, self._format_scored(scored_result))
+                            self._append_jsonl(
+                                self.scored_output, self._format_scored(scored_result)
+                            )
                             score_bar.update(1)
                             if score_overall_bar:
                                 score_overall_bar.update(1)
 
-                            if str(tid) not in skip_train_ids and not _is_score_timeout(scored_result):
+                            if str(tid) not in skip_train_ids and not _is_score_timeout(
+                                scored_result
+                            ):
                                 record = self._train_one_item(
                                     scored_result,
                                     checkpoint_dir=checkpoint_dir,
@@ -617,7 +871,9 @@ class BatchPipeline:
 
         logger.info(
             "Pipeline complete: %d generated, %d scored, %d trained",
-            len(tasks), len(results), len(trained_records),
+            len(tasks),
+            len(results),
+            len(trained_records),
         )
         return results, trained_records, self._last_checkpoint
 
@@ -660,14 +916,28 @@ class BatchPipeline:
 
         scored_results: List[Dict[str, Any]] = []
 
-        score_bar = tqdm(total=len(results), desc="Score", unit="task", position=0)
+        score_bar = tqdm(
+            total=len(results),
+            desc="Score",
+            unit="task",
+            position=0,
+            disable=_TQDM_DISABLE,
+        )
         train_bar = None
         if train:
-            train_bar = tqdm(total=len(results), desc="Train", unit="task", position=1)
+            train_bar = tqdm(
+                total=len(results),
+                desc="Train",
+                unit="task",
+                position=1,
+                disable=_TQDM_DISABLE,
+            )
 
         with ThreadPoolExecutor(max_workers=self.score_workers) as pool:
             future_map = {
-                pool.submit(self._score_item, item["item"], item["entry"]): item["item"].get("task_id")
+                pool.submit(self._score_item, item["item"], item["entry"]): item[
+                    "item"
+                ].get("task_id")
                 for item in score_items
             }
             pending = set(future_map.keys())
@@ -679,7 +949,9 @@ class BatchPipeline:
                     item["score"] = None
                     scored_results.append(item)
                     if self.scored_output:
-                        self._append_jsonl(self.scored_output, self._format_scored(item))
+                        self._append_jsonl(
+                            self.scored_output, self._format_scored(item)
+                        )
                     score_bar.update(1)
                     if train_bar:
                         train_bar.update(1)
@@ -694,14 +966,25 @@ class BatchPipeline:
                             logger.error("Task %s score failed: %s", task_id, exc)
                             scored_result = {
                                 "task_id": task_id,
-                                "score": {"error_type": "timeout" if _is_timeout_error(exc) else "error", "raw": str(exc)},
+                                "score": {
+                                    "error_type": "timeout"
+                                    if _is_timeout_error(exc)
+                                    else "error",
+                                    "raw": str(exc),
+                                },
                             }
                         scored_results.append(scored_result)
                         if self.scored_output:
-                            self._append_jsonl(self.scored_output, self._format_scored(scored_result))
+                            self._append_jsonl(
+                                self.scored_output, self._format_scored(scored_result)
+                            )
                         score_bar.update(1)
 
-                        if train and str(task_id) not in skip_train_ids and not _is_score_timeout(scored_result):
+                        if (
+                            train
+                            and str(task_id) not in skip_train_ids
+                            and not _is_score_timeout(scored_result)
+                        ):
                             record = self._train_one_item(
                                 scored_result,
                                 checkpoint_dir=checkpoint_dir,
@@ -716,11 +999,15 @@ class BatchPipeline:
                 if train_bar:
                     train_bar.close()
 
-        if train and checkpoint_dir and save_final and self._train_count > self._train_last_saved:
+        if (
+            train
+            and checkpoint_dir
+            and save_final
+            and self._train_count > self._train_last_saved
+        ):
             self._last_checkpoint = self._save_checkpoint(checkpoint_dir)
 
         return scored_results, trained_records, self._last_checkpoint
-
 
     def _save_checkpoint(self, checkpoint_dir: Path) -> Optional[Dict[str, Any]]:
         if self.memory_service is None:
@@ -730,7 +1017,9 @@ class BatchPipeline:
             ckpt_id += "_1"
         self._checkpoint_ts_used.add(ckpt_id)
         try:
-            return self.memory_service.save_checkpoint_snapshot(str(checkpoint_dir), ckpt_id)
+            return self.memory_service.save_checkpoint_snapshot(
+                str(checkpoint_dir), ckpt_id
+            )
         except Exception as exc:
             logger.warning("Failed to save checkpoint %s: %s", ckpt_id, exc)
             return None
@@ -758,10 +1047,23 @@ class BatchPipeline:
             ensure_ascii=False,
         )
         score_info = item.get("score", {})
-        is_success = status == "completed"
+        score_ratio = 0.0
+        has_ratio = False
+
         if isinstance(score_info, dict) and score_info.get("max_score"):
-            ratio = score_info.get("score", 0) / score_info["max_score"]
-            is_success = is_success or ratio >= 0.5
+            score_ratio = float(score_info.get("score", 0)) / float(
+                score_info["max_score"]
+            )
+            has_ratio = True
+        elif status == "completed":
+            score_ratio = 1.0
+            has_ratio = True
+
+        is_success = status == "completed" and not has_ratio
+        if has_ratio:
+            is_success = score_ratio >= SCORE_BUCKET_MID
+
+        quality_bucket = _score_bucket(score_ratio if has_ratio else None)
 
         try:
             self.memory_service.add_memory(
@@ -775,6 +1077,8 @@ class BatchPipeline:
                     else None,
                     "task_status": status,
                     "score": score_info,
+                    "score_ratio": score_ratio,
+                    "quality_bucket": quality_bucket,
                 },
             )
             record = {
@@ -819,11 +1123,20 @@ class BatchPipeline:
 
         train_desc = _batch_desc("Train", batch_idx, total_batches)
         bars: List[Any] = [
-            tqdm(results, desc=train_desc, unit="task", position=0),
+            tqdm(
+                results, desc=train_desc, unit="task", position=0, disable=_TQDM_DISABLE
+            ),
         ]
         if total_batches > 1:
             bars.append(
-                tqdm(total=effective_global_total, desc="Overall Train", unit="task", initial=global_offset, position=1),
+                tqdm(
+                    total=effective_global_total,
+                    desc="Overall Train",
+                    unit="task",
+                    initial=global_offset,
+                    position=1,
+                    disable=_TQDM_DISABLE,
+                ),
             )
 
         try:
@@ -850,10 +1163,23 @@ class BatchPipeline:
                     ensure_ascii=False,
                 )
                 score_info = item.get("score", {})
-                is_success = status == "completed"
+                score_ratio = 0.0
+                has_ratio = False
+
                 if isinstance(score_info, dict) and score_info.get("max_score"):
-                    ratio = score_info.get("score", 0) / score_info["max_score"]
-                    is_success = is_success or ratio >= 0.5
+                    score_ratio = float(score_info.get("score", 0)) / float(
+                        score_info["max_score"]
+                    )
+                    has_ratio = True
+                elif status == "completed":
+                    score_ratio = 1.0
+                    has_ratio = True
+
+                is_success = status == "completed" and not has_ratio
+                if has_ratio:
+                    is_success = score_ratio >= SCORE_BUCKET_MID
+
+                quality_bucket = _score_bucket(score_ratio if has_ratio else None)
 
                 try:
                     self.memory_service.add_memory(
@@ -867,6 +1193,8 @@ class BatchPipeline:
                             else None,
                             "task_status": status,
                             "score": score_info,
+                            "score_ratio": score_ratio,
+                            "quality_bucket": quality_bucket,
                         },
                     )
                     trained += 1
@@ -923,7 +1251,9 @@ class BatchPipeline:
         for r in results:
             error_type = r.get("error_type")
             score_info = r.get("score")
-            score_error_type = score_info.get("error_type") if isinstance(score_info, dict) else None
+            score_error_type = (
+                score_info.get("error_type") if isinstance(score_info, dict) else None
+            )
 
             resp = r.get("response")
             resp_status = resp.get("status") if isinstance(resp, dict) else None
@@ -959,8 +1289,10 @@ class BatchPipeline:
             print("  Avg Score: N/A (no successful scores)")
 
         if total_fail:
-            print(f"  Errors: gen_timeout={gen_timeout}, score_timeout={score_timeout}, "
-                  f"gen_error={gen_error}, score_error={score_error}")
+            print(
+                f"  Errors: gen_timeout={gen_timeout}, score_timeout={score_timeout}, "
+                f"gen_error={gen_error}, score_error={score_error}"
+            )
 
         print(f"{'=' * 50}\n")
 
