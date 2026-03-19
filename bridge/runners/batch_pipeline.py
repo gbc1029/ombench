@@ -378,8 +378,9 @@ class BatchPipeline:
         entry: Dict[str, Any],
         *,
         mode: str,
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         system_prompt, user_prompt = build_plain_prompts(entry)
+        retrieved_memory_ids: List[str] = []
         if mode == "memrl":
             if self.memory_service is not None:
                 try:
@@ -398,13 +399,20 @@ class BatchPipeline:
                         memories = [m for m in selected if isinstance(m, dict)]
                     memory_text = _format_memory_sections(memories)
                     user_prompt = apply_memory(user_prompt, memory_text)
+                    retrieved_memory_ids = [
+                        mid for m in memories if (mid := m.get("memory_id")) is not None
+                    ]
                 except Exception as exc:
                     logger.warning("Memory retrieval failed for %s: %s", task_id, exc)
             elif self.memory_context:
                 user_prompt = apply_memory(
                     user_prompt, self.memory_context.get(task_id)
                 )
-        return {"system_prompt": system_prompt, "user_prompt": user_prompt}
+        return {
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "retrieved_memory_ids": retrieved_memory_ids,
+        }
 
     def _generate_one_direct(
         self,
@@ -432,6 +440,7 @@ class BatchPipeline:
             "answer": _extract_answer(response),
             "system_prompt": prompts["system_prompt"],
             "user_prompt": prompts["user_prompt"],
+            "retrieved_memory_ids": prompts.get("retrieved_memory_ids", []),
         }
         if _is_gen_timeout(result):
             result["error"] = "timeout"
@@ -1149,10 +1158,14 @@ class BatchPipeline:
         quality_bucket = _score_bucket(score_ratio if has_ratio else None)
 
         try:
+            retrieved_ids = item.get("retrieved_memory_ids", [])
+            if retrieved_ids:
+                self.memory_service.update_values([is_success], [retrieved_ids])
             self.memory_service.add_memory(
                 task_description=item.get("user_prompt", ""),
                 trajectory=trajectory,
                 success=is_success,
+                retrieved_memory_ids=retrieved_ids or None,
                 metadata={
                     "task_id": task_id,
                     "request_id": response.get("request_id")
