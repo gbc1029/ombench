@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(__file__).resolve().parents[2] / "datasets" / "OneMillion-Bench",
     )
-    parser.add_argument("--base-url", default="http://10.245.198.39:8000")
+    parser.add_argument("--base-url", default="http://10.245.189.39:8001")
     parser.add_argument("--endpoint", default="/task/solve")
     parser.add_argument("--model", default="qwen")
     parser.add_argument("--memory-context", type=Path, default=None)
@@ -149,6 +149,12 @@ def parse_args() -> argparse.Namespace:
         help="Max number of tasks to process (0 = all)",
     )
     parser.add_argument("--max-retries", type=int, default=1)
+    parser.add_argument(
+        "-uniform",
+        action="store_true",
+        default=False,
+        help="Use uniform per-domain sampling instead of global random when --limit is set",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--generated-output",
@@ -320,12 +326,13 @@ def _clear_file(path: Path) -> None:
 
 
 def _migrate_file(path: Path, batch_idx: int) -> None:
-    """Rename an existing output file to *_batch{N}.ext, then clear the original."""
+    """Rename an existing output file to *_batch{N}_{YYMMDD_HHMMSS}.ext, then clear the original."""
     if not path.exists() or path.stat().st_size == 0:
         return
     suffix = path.suffix
     stem = path.stem
-    dest = path.with_name(f"{stem}_batch{batch_idx}{suffix}")
+    ts = time.strftime("%y%m%d_%H%M%S")
+    dest = path.with_name(f"{stem}_batch{batch_idx}_{ts}{suffix}")
     path.rename(dest)
     _log.info("Migrated %s -> %s", path, dest)
     _clear_file(path)
@@ -337,6 +344,87 @@ def _filter_results(
     if not skip_ids:
         return results
     return [item for item in results if str(item.get("task_id")) not in skip_ids]
+
+
+def _create_scores_file(output_dir: Path) -> Path:
+    """Create a timestamped JSONL file for recording per-batch scores."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return output_dir / f"batch_scores_{ts}.jsonl"
+
+
+def _append_batch_scores(
+    scores_file: Path,
+    batch_results: list[dict[str, object]],
+    batch_idx: int,
+    total_batches: int,
+) -> None:
+    """Append one batch's score record to the scores JSONL file.
+
+    Each line is a self-contained JSON object for one batch, containing:
+    - batch index and progress
+    - per-task scores (task_id, score, max_score, percent)
+    - per-domain average percent
+    - batch overall average percent
+    """
+    task_scores: list[dict[str, object]] = []
+    domain_agg: dict[str, dict[str, float]] = {}
+
+    for r in batch_results:
+        score_info = r.get("score")
+        if not isinstance(score_info, dict) or not score_info.get("max_score"):
+            continue
+
+        task_id = str(r.get("task_id", ""))
+        score = float(score_info.get("score", 0))
+        max_score = float(score_info["max_score"])
+        pct = score / max_score * 100 if max_score > 0 else 0.0
+
+        task_scores.append(
+            {
+                "task_id": task_id,
+                "score": score,
+                "max_score": max_score,
+                "percent": round(pct, 2),
+            }
+        )
+
+        domain = task_id.split("/", 1)[0] if task_id else "unknown"
+        if domain not in domain_agg:
+            domain_agg[domain] = {"sum_score": 0.0, "sum_max": 0.0, "count": 0}
+        domain_agg[domain]["sum_score"] += score
+        domain_agg[domain]["sum_max"] += max_score
+        domain_agg[domain]["count"] += 1
+
+    domain_averages: dict[str, object] = {}
+    total_score = 0.0
+    total_max = 0.0
+    for domain in sorted(domain_agg):
+        d = domain_agg[domain]
+        dpct = d["sum_score"] / d["sum_max"] * 100 if d["sum_max"] > 0 else 0.0
+        domain_averages[domain] = {
+            "count": int(d["count"]),
+            "avg_percent": round(dpct, 2),
+        }
+        total_score += d["sum_score"]
+        total_max += d["sum_max"]
+
+    overall_pct = total_score / total_max * 100 if total_max > 0 else 0.0
+
+    record = {
+        "batch": batch_idx,
+        "total_batches": total_batches,
+        "scored_count": len(task_scores),
+        "overall_avg_percent": round(overall_pct, 2),
+        "domain_averages": domain_averages,
+        "task_scores": task_scores,
+    }
+
+    with open(scores_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    _log.info(
+        "Batch %d/%d scores appended to %s", batch_idx, total_batches, scores_file
+    )
 
 
 def _iter_batches(
@@ -556,6 +644,7 @@ def main() -> None:
             memory_context=memory_context,
             workers=args.workers,
             limit=args.limit,
+            uniform=args.uniform,
             dry_run=args.dry_run,
             max_retries=args.max_retries,
             score_workers=args.score_workers,
@@ -603,6 +692,7 @@ def main() -> None:
                 total_batches = len(batches)
                 global_total = len(tasks)
                 global_offset = 0
+                scores_file = _create_scores_file(args.scored_output.parent)
 
                 for idx, batch in enumerate(batches):
                     batch_idx = idx + 1
@@ -626,12 +716,8 @@ def main() -> None:
                             total_batches,
                         )
 
-                    # After the first batch: migrate output files to *_batch{N}.ext
-                    # then clear originals; resume flags only apply to batch 1
+                    # After the first batch: resume flags only apply to batch 1
                     if idx > 0:
-                        _migrate_file(args.generated_output, idx)
-                        _migrate_file(args.scored_output, idx)
-                        _migrate_file(args.trained_output, idx)
                         skip_train_ids = set()
 
                     batch_results, trained_records, last_checkpoint = (
@@ -648,9 +734,22 @@ def main() -> None:
                             global_total=global_total,
                         )
                     )
+                    print(f"\n--- Batch {batch_idx}/{total_batches} Summary ---")
+                    pipeline.print_summary(batch_results)
                     all_results.extend(batch_results)
                     all_trained.extend(trained_records)
                     global_offset += len(batch)
+
+                    _append_batch_scores(
+                        scores_file,
+                        batch_results,
+                        batch_idx,
+                        total_batches,
+                    )
+
+                    _migrate_file(args.generated_output, batch_idx)
+                    _migrate_file(args.scored_output, batch_idx)
+                    _migrate_file(args.trained_output, batch_idx)
 
                     if trained_records:
                         skip_train_ids.update(
@@ -673,6 +772,7 @@ def main() -> None:
                                     exc,
                                 )
 
+                print(f"\n--- Final Summary (All {global_total} tasks) ---")
                 pipeline.print_summary(all_results)
             else:
                 results, trained_records, last_checkpoint = (

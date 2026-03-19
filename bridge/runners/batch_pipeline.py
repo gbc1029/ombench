@@ -183,10 +183,72 @@ def _load_completed_ids(path: Path) -> set:
     return ids
 
 
+def _task_subset(task_id: Any) -> str:
+    if not task_id:
+        return "unknown"
+    return str(task_id).split("/", 1)[0]
+
+
 def _batch_desc(label: str, batch_idx: int, total_batches: int) -> str:
     if total_batches <= 1:
         return label
     return f"{label} [batch {batch_idx}/{total_batches}]"
+
+
+def _clean_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Strip redundant IDs/timestamps from session messages for training.
+
+    Keeps role, model info, and semantically meaningful parts (text, reasoning,
+    tool calls, step-finish reason).  Drops step-start entirely and removes all
+    per-part / per-message IDs, sessionIDs, timestamps, paths, snapshots, and
+    other metadata that adds bulk without training value.
+    """
+    cleaned: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        info = msg.get("info") or {}
+        clean_msg: Dict[str, Any] = {"role": info.get("role")}
+        if info.get("role") == "assistant":
+            if info.get("modelID"):
+                clean_msg["modelID"] = info["modelID"]
+            if info.get("tokens"):
+                clean_msg["tokens"] = info["tokens"]
+            if info.get("finish"):
+                clean_msg["finish"] = info["finish"]
+
+        clean_parts: List[Dict[str, Any]] = []
+        for part in msg.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text":
+                clean_parts.append({"type": "text", "text": part.get("text", "")})
+            elif ptype == "reasoning":
+                clean_parts.append({"type": "reasoning", "text": part.get("text", "")})
+            elif ptype == "tool":
+                state = part.get("state") or {}
+                clean_tool: Dict[str, Any] = {
+                    "type": "tool",
+                    "tool": part.get("tool"),
+                    "input": state.get("input"),
+                }
+                if state.get("output") is not None:
+                    clean_tool["output"] = state["output"]
+                if state.get("error"):
+                    clean_tool["error"] = state["error"]
+                if state.get("status"):
+                    clean_tool["status"] = state["status"]
+                clean_parts.append(clean_tool)
+            elif ptype == "step-finish":
+                clean_parts.append(
+                    {"type": "step-finish", "reason": part.get("reason")}
+                )
+            # step-start dropped entirely (only contains git snapshot hash)
+
+        clean_msg["parts"] = clean_parts
+        cleaned.append(clean_msg)
+    return cleaned
 
 
 class BatchPipeline:
@@ -200,6 +262,7 @@ class BatchPipeline:
         memory_context: Optional[Dict[str, str]] = None,
         workers: int = 4,
         limit: int = 0,
+        uniform: bool = False,
         dry_run: bool = False,
         max_retries: int = 1,
         output: Optional[Path] = None,
@@ -215,6 +278,7 @@ class BatchPipeline:
         self.memory_context = memory_context or {}
         self.workers = max(workers, 1)
         self.limit = limit
+        self.uniform = uniform
         self.dry_run = dry_run
         self.max_retries = max_retries
         self.output = output
@@ -393,7 +457,26 @@ class BatchPipeline:
         ]
         if tasks:
             random.shuffle(tasks)
-        if self.limit:
+        if self.limit and self.uniform:
+            groups: Dict[str, List[tuple[str, Dict[str, Any]]]] = defaultdict(list)
+            for t in tasks:
+                groups[_task_subset(t[0])].append(t)
+            num_groups = len(groups)
+            base_quota = self.limit // num_groups
+            remainder = self.limit % num_groups
+            sampled: List[tuple[str, Dict[str, Any]]] = []
+            for idx, (domain, group_tasks) in enumerate(sorted(groups.items())):
+                quota = base_quota + (1 if idx < remainder else 0)
+                sampled.extend(group_tasks[:quota])
+            random.shuffle(sampled)
+            tasks = sampled
+            logger.info(
+                "Uniform sampling: %d domains, %d tasks selected (limit=%d)",
+                num_groups,
+                len(tasks),
+                self.limit,
+            )
+        elif self.limit:
             tasks = tasks[: self.limit]
         return tasks
 
@@ -1040,12 +1123,12 @@ class BatchPipeline:
             return None
         response = item.get("response", {})
         status = response.get("status") if isinstance(response, dict) else None
-        trajectory = json.dumps(
+        raw_messages = (
             response.get("session_data", {}).get("messages", [])
             if isinstance(response, dict)
-            else [],
-            ensure_ascii=False,
+            else []
         )
+        trajectory = json.dumps(_clean_messages(raw_messages), ensure_ascii=False)
         score_info = item.get("score", {})
         score_ratio = 0.0
         has_ratio = False
@@ -1156,11 +1239,13 @@ class BatchPipeline:
                     continue
                 response = item.get("response", {})
                 status = response.get("status") if isinstance(response, dict) else None
-                trajectory = json.dumps(
+                raw_messages = (
                     response.get("session_data", {}).get("messages", [])
                     if isinstance(response, dict)
-                    else [],
-                    ensure_ascii=False,
+                    else []
+                )
+                trajectory = json.dumps(
+                    _clean_messages(raw_messages), ensure_ascii=False
                 )
                 score_info = item.get("score", {})
                 score_ratio = 0.0
@@ -1293,6 +1378,53 @@ class BatchPipeline:
                 f"  Errors: gen_timeout={gen_timeout}, score_timeout={score_timeout}, "
                 f"gen_error={gen_error}, score_error={score_error}"
             )
+
+        # --- Per-domain breakdown ---
+        domain_stats: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {
+                "total": 0,
+                "scored": 0,
+                "sum_score": 0.0,
+                "sum_max": 0.0,
+                "failed": 0,
+            }
+        )
+        for r in results:
+            domain = _task_subset(r.get("task_id"))
+            domain_stats[domain]["total"] += 1
+
+            score_info = r.get("score")
+            if isinstance(score_info, dict) and score_info.get("max_score"):
+                domain_stats[domain]["scored"] += 1
+                domain_stats[domain]["sum_score"] += float(score_info.get("score", 0))
+                domain_stats[domain]["sum_max"] += float(score_info["max_score"])
+            else:
+                error_type = r.get("error_type")
+                resp = r.get("response")
+                resp_status = resp.get("status") if isinstance(resp, dict) else None
+                score_err = (
+                    score_info.get("error_type")
+                    if isinstance(score_info, dict)
+                    else None
+                )
+                if error_type or resp_status == "timeout" or score_err:
+                    domain_stats[domain]["failed"] += 1
+
+        if domain_stats:
+            print(
+                f"\n  {'Domain':<20} {'Total':>6} {'Scored':>7} {'Failed':>7} {'Avg%':>8}"
+            )
+            print(f"  {'-' * 48}")
+            for domain in sorted(domain_stats):
+                s = domain_stats[domain]
+                if s["scored"] > 0 and s["sum_max"] > 0:
+                    pct = s["sum_score"] / s["sum_max"] * 100
+                    pct_str = f"{pct:.1f}%"
+                else:
+                    pct_str = "N/A"
+                print(
+                    f"  {domain:<20} {s['total']:>6} {s['scored']:>7} {s['failed']:>7} {pct_str:>8}"
+                )
 
         print(f"{'=' * 50}\n")
 

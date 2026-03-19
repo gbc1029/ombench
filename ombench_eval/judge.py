@@ -28,6 +28,12 @@ def _clean_and_parse_json(json_str: str) -> Any:
     except json.JSONDecodeError:
         pass
 
+    escaped = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", json_str)
+    try:
+        return json.loads(escaped)
+    except json.JSONDecodeError:
+        pass
+
     fixed = re.sub(r",\s*\]", "]", json_str)
     fixed = re.sub(r",\s*\}", "}", fixed)
     try:
@@ -123,6 +129,22 @@ def _extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
                 return parsed
         except ValueError:
             pass
+
+    pattern = (
+        r'"rubric_id"\s*:\s*(\d+)\s*,\s*'
+        r'"status"\s*:\s*"((?:是|否|Yes|No|yes|no|Y|N|YES|NO|true|false|True|False|命中)?)"\s*,\s*'
+        r'"justification"\s*:\s*"([\s\S]*?)"(?:\s*\})'
+    )
+    matches = list(re.finditer(pattern, text))
+    if matches:
+        return [
+            {
+                "rubric_id": int(m.group(1)),
+                "status": m.group(2),
+                "justification": m.group(3),
+            }
+            for m in matches
+        ]
 
     return None
 
