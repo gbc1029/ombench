@@ -228,6 +228,7 @@ def _build_memory_service(args, llm, embedder, temp_dir, *, train_api_base: str)
         StrategyConfiguration,
         UpdateStrategy,
     )
+    from memrl.service.value_driven import RLConfig
 
     api_key = os.environ.get(args.train_api_key_env, "placeholder")
     config = {
@@ -286,6 +287,7 @@ def _build_memory_service(args, llm, embedder, temp_dir, *, train_api_base: str)
         user_id="batch_pipeline",
         enable_value_driven=True,
         max_keywords=8,
+        rl_config=RLConfig(novelty_threshold=0.95),
     )
 
 

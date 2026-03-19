@@ -432,9 +432,36 @@ python -m bridge.runners.run_batch_pipeline \
 每条任务完成评分后，训练阶段会执行两个操作：
 
 1. **Q 值更新**：根据任务成败，对本次检索使用的记忆执行 Q-learning 更新（`update_values`）。成功任务给予正奖励（+1.0），失败任务给予负奖励（-1.0），使记忆的 Q 值逐步反映其对任务成功的贡献。
-2. **记忆写入**：将本次任务的轨迹（trajectory）和检索引用关系写入记忆池（`add_memory`），供后续批次检索使用。
+2. **记忆写入**：将本次任务的轨迹（trajectory）和检索引用关系写入记忆池（`add_memory`），供后续批次检索使用。写入前会通过 MemoryCurator 进行去重检查：若新记忆与已有记忆的相似度 ≥ `novelty_threshold`（默认 0.95），则跳过写入，改为给已有记忆归因奖励。
 
 Q 值在记忆的 metadata 中维护（`q_value`、`q_visits`、`last_reward`），可通过 `q_min_threshold` 在检索时过滤低质量记忆。
+
+### 记忆去重（MemoryCurator）
+
+训练阶段集成了在线去重机制，防止记忆池中出现高度相似的冗余记忆：
+
+- **在线去重**：`add_memories()` 写入前，调用 `MemoryCurator.find_merge_target()` 检查新记忆是否与已有记忆高度相似（余弦相似度 ≥ `novelty_threshold`）。若匹配，跳过写入并将奖励归因给已有记忆。
+- **离线优化**：可使用 `curate_memories.py` 对已有 checkpoint 进行回溯去重，清理历史冗余记忆。
+
+```bash
+# 预览去重效果（不修改文件）
+python -m bridge.runners.curate_memories \
+  --checkpoint checkpoints/batch_pipeline/snapshot/20260319_205903 \
+  --novelty-threshold 0.95 \
+  --dry-run
+
+# 执行去重（原文件备份为 .bak）
+python -m bridge.runners.curate_memories \
+  --checkpoint checkpoints/batch_pipeline/snapshot/20260319_205903 \
+  --novelty-threshold 0.95
+```
+
+| 参数                  | 默认值 | 说明                                        |
+| --------------------- | ------ | ------------------------------------------- |
+| `--checkpoint`        | 必填   | checkpoint 快照目录路径                     |
+| `--novelty-threshold` | `0.95` | 相似度阈值，高于此值视为重复                |
+| `--dry-run`           | false  | 仅打印去重结果，不修改文件                  |
+| `--output`            | 无     | 输出路径（默认原地覆盖，原文件备份为 .bak） |
 
 ### 串行联动训练入口
 
@@ -493,6 +520,7 @@ python -m bridge.runners.run_onemillion_memrl \
 | `bridge/adapters/hash_embedder.py`       | 本地 hash embedder（避免远端 embedding 调用）                            |
 | `bridge/runners/batch_pipeline.py`       | 批量管线核心（`BatchPipeline` 类，实时写入 + 进度展示 + Q 值学习）       |
 | `bridge/runners/run_batch_pipeline.py`   | 批量管线 CLI 入口（分批成绩保存 + 带时间戳归档）                         |
+| `bridge/runners/curate_memories.py`      | 离线记忆去重工具（基于余弦相似度清理冗余记忆）                           |
 | `bridge/runners/run_onemillion_memrl.py` | 串行联动训练入口                                                         |
 | `ombench_eval/evaluator.py`              | 评分核心（`score_response` 单条评分 + `score_responses_batch` 并发封装） |
 | `ombench_eval/judge.py`                  | Judge 实现（`OpenAIJudge`）                                              |

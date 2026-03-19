@@ -1677,7 +1677,52 @@ class MemoryService:
                 retrieved_ids_payload.append(retrieved_ids)
                 metadata_list.append(meta)
 
-            results = self.update_memories(
+            results = {}
+            keep_indices = None
+
+            # --- MemoryCurator: skip writing memories that are near-duplicates ---
+            curator = getattr(self, "_curator", None)
+            if curator is not None:
+                keep_indices = []
+                for i in range(len(td_list)):
+                    merge_target = curator.find_merge_target(td_list[i])
+                    if merge_target is not None:
+                        # Attribute reward to the existing similar memory instead
+                        reward = (
+                            self.rl_config.success_reward
+                            if succ_list[i]
+                            else self.rl_config.failure_reward
+                        )
+                        curator.attribute_reward(merge_target["memory_id"], reward)
+                        results[task_descriptions[i]] = merge_target["memory_id"]
+                        logger.info(
+                            "Curator merged task '%s' into existing memory %s (sim=%.3f)",
+                            td_list[i][:60],
+                            merge_target["memory_id"],
+                            merge_target.get("similarity", 0),
+                        )
+                    else:
+                        keep_indices.append(i)
+
+                if len(keep_indices) < len(td_list):
+                    logger.info(
+                        "Curator: %d/%d memories merged, %d new to write",
+                        len(td_list) - len(keep_indices),
+                        len(td_list),
+                        len(keep_indices),
+                    )
+                    td_list = [td_list[i] for i in keep_indices]
+                    traj_list = [traj_list[i] for i in keep_indices]
+                    succ_list = [succ_list[i] for i in keep_indices]
+                    retrieved_ids_payload = [
+                        retrieved_ids_payload[i] for i in keep_indices
+                    ]
+                    metadata_list = [metadata_list[i] for i in keep_indices]
+
+            if not td_list:
+            return write_results
+
+            write_results = self.update_memories(
                 task_descriptions=td_list,
                 trajectories=traj_list,
                 successes=succ_list,
@@ -1686,13 +1731,23 @@ class MemoryService:
             )
 
             for i, task_description in enumerate(task_descriptions):
-                if i < len(results):
-                    recorded_task, mem_id = results[i]
+                # Skip tasks already handled by curator merge
+                if task_description in results:
+                    continue
+
+                write_idx = i
+                # If curator filtered some items, remap the index
+                if curator is not None and keep_indices is not None:
+                    if i not in keep_indices:
+                        continue
+                    write_idx = keep_indices.index(i)
+
+                if write_idx < len(write_results):
+                    recorded_task, mem_id = write_results[write_idx]
                     if recorded_task != task_description[:4096]:
                         logger.warning(
                             f"Task description mismatch at index {i}: expected '{task_description}', got '{recorded_task}'"
                         )
-                    mem_id = mem_id
                 else:
                     logger.warning(f"No result found for task {task_description}")
                     mem_id = None
